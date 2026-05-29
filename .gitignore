@@ -46,3 +46,6 @@ build/
 Thumbs.db
 .idea/
 .vscode/
+
+.vercel
+vercel_project*.json

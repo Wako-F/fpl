@@ -43,13 +43,19 @@ The Kenya country league is `131`; the Kenya region id observed from manager pro
 
 ## Deployment Notes
 
-The Vercel project should build from the repository root using `vercel.json`.
+The Vercel project should use `frontend` as its root directory. The project config lives in `frontend/vercel.json`.
 
 Required Vercel environment variables:
 
 ```bash
-FPLKE_API_BASE=https://your-public-api-host
+FPLKE_API_BASE=http://38.242.228.254/fplke-data
 NEXT_PUBLIC_BASE_PATH=
+```
+
+CLI deploy:
+
+```bash
+npx vercel deploy --prod --cwd frontend --local-config frontend/vercel.json
 ```
 
 Do not commit VPS operation notes, SSH commands, `.env` files, deployment bundles, or generated archives.
