@@ -1,0 +1,48 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+!**/.env.example
+*.pem
+*.key
+*.pub
+*.p12
+*.crt
+*.kubeconfig
+.db_password
+
+# VPS / production operation notes and one-off remote scripts
+VPS_OPERATIONS.md
+*_remote.sh
+
+# Generated deployment bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Logs and runtime output
+logs/
+*.log
+nohup.out
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+.vercel/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
