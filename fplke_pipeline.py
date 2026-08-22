@@ -16,6 +16,7 @@ import random
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Iterable
 
 import asyncpg
@@ -31,6 +32,16 @@ def json_dumps(value: Any) -> str:
 def decimal_or_none(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
+
+
+def datetime_or_none(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise TypeError(f"Expected ISO timestamp, got {type(value).__name__}")
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
@@ -137,7 +148,7 @@ class SeasonPipeline:
                         settings.season_id,
                         event["id"],
                         event["name"],
-                        event["deadline_time"],
+                        datetime_or_none(event["deadline_time"]),
                         event.get("is_previous", False),
                         event.get("is_current", False),
                         event.get("is_next", False),
@@ -256,7 +267,7 @@ class SeasonPipeline:
                         settings.season_id,
                         fixture["id"],
                         fixture.get("event"),
-                        fixture.get("kickoff_time"),
+                        datetime_or_none(fixture.get("kickoff_time")),
                         fixture["team_h"],
                         fixture["team_a"],
                         fixture.get("team_h_score"),

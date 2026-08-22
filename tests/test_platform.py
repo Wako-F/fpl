@@ -5,7 +5,7 @@ from decimal import Decimal
 os.environ.setdefault("DATABASE_URL", "postgresql://example:example@127.0.0.1/example")
 
 from fplke_api import app  # noqa: E402
-from fplke_pipeline import decimal_or_none  # noqa: E402
+from fplke_pipeline import datetime_or_none, decimal_or_none  # noqa: E402
 from generate_weekly_content import manager_label, render_engineering, render_social  # noqa: E402
 
 
@@ -14,6 +14,11 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertEqual(decimal_or_none("12.5"), Decimal("12.5"))
         self.assertIsNone(decimal_or_none(""))
         self.assertIsNone(decimal_or_none("not-a-number"))
+
+    def test_iso_timestamp_normalisation(self):
+        value = datetime_or_none("2026-08-21T17:30:00Z")
+        self.assertEqual(value.isoformat(), "2026-08-21T17:30:00+00:00")
+        self.assertIsNone(datetime_or_none(None))
 
     def test_manager_label_fallbacks(self):
         self.assertEqual(manager_label({"entry_name": "Mathare XI"}), "Mathare XI")
