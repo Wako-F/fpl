@@ -320,6 +320,7 @@ CREATE OR REPLACE VIEW vw_latest_standings_snapshot AS
 SELECT DISTINCT ON (season_id)
     id, season_id, event, captured_at, is_complete, pages_collected, managers_collected, source_note
 FROM standings_snapshots
+WHERE pages_collected > 0
 ORDER BY season_id, captured_at DESC;
 
 CREATE OR REPLACE VIEW vw_latest_standings AS
