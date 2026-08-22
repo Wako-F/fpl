@@ -1,102 +1,39 @@
+import type { Metadata } from "next";
 import Link from "next/link";
-import { ConsistencyScatter, ValueRankScatter } from "@/components/charts";
-import { CompactManagerTable } from "@/components/insight-tables";
-import { AnimatedRankRace } from "@/components/rank-race";
-import { SectionLabel, SiteHeader, StatBlock } from "@/components/shell";
-import { getLab } from "@/lib/api";
-import { managerIdentity, primaryManagerName } from "@/lib/display";
+import { ArrowRight, BracketsCurly, Database, GitBranch, Notebook } from "@phosphor-icons/react/dist/ssr";
+import { SiteFooter, SiteHeader } from "@/components/shell";
 
-export const dynamic = "force-dynamic";
+export const metadata: Metadata = { title: "Data lab", description: "The data science and engineering work behind FPL Kenya." };
 
-const nf = new Intl.NumberFormat("en-US");
+const work = [
+  { icon: Database, title: "Season-aware warehouse", body: "Immutable raw snapshots feed canonical event facts, standings snapshots, and a versioned editorial layer." },
+  { icon: BracketsCurly, title: "Reproducible content", body: "One JSON brief drives the article, social copy, engineering note, and visual assets for each gameweek." },
+  { icon: GitBranch, title: "Models with baselines", body: "Expected-points and differential models will ship with cutoffs, backtests, calibration, and leakage checks." },
+  { icon: Notebook, title: "Weekly build notes", body: "Each report exposes one technical decision: data quality, dimensional modelling, API design, caching, or evaluation." },
+];
 
-export default async function LabPage() {
-  const lab = await getLab();
-  const topExplosion = lab.explosions[0];
-  const topBench = lab.benchPain[0];
-
+export default function LabPage() {
   return (
     <>
       <SiteHeader />
-      <main className="mx-auto max-w-[1500px] px-5 py-10 md:px-8 md:py-16">
-        <div className="mb-10 max-w-5xl">
-          <div className="mono-num mb-3 text-xs uppercase tracking-[0.24em] text-[#1f6b4d]">
-            Scatterplots, rank race, outliers
-          </div>
-          <h1 className="text-4xl font-semibold leading-none tracking-tight sm:text-5xl md:text-7xl">
-            Experimental views of the Kenya FPL dataset.
-          </h1>
-        </div>
+      <main id="main-content" className="mx-auto max-w-[1500px] px-5 py-12 md:px-8 md:py-20">
+        <div className="font-mono text-xs uppercase tracking-[0.22em] text-[#1f6b4d]">Data science · engineering</div>
+        <h1 className="mt-5 max-w-6xl text-balance text-5xl font-semibold leading-[0.93] tracking-[-0.05em] sm:text-6xl md:text-8xl">The work behind the weekly numbers.</h1>
+        <p className="mt-7 max-w-[65ch] text-lg leading-8 text-stone-600">A public build log for the pipeline, metrics, models, and editorial tooling that power FPL Kenya.</p>
 
-        <section className="grid grid-cols-1 gap-5 md:grid-cols-3">
-          <StatBlock label="Bench pain leader" value={nf.format(Number(topBench?.bench_points ?? 0))} detail={managerIdentity(topBench)} />
-          <StatBlock label="Biggest one-week score" value={String(topExplosion?.points ?? 0)} detail={`GW${topExplosion?.event ?? "-"}`} />
-          <StatBlock label="Race field" value="Top 50" detail="final Kenya leaderboard" />
+        <section className="mt-16 grid gap-px overflow-hidden bg-stone-950/10 md:grid-cols-2">
+          {work.map((item, index) => {
+            const Icon = item.icon;
+            return <article key={item.title} className={`min-h-64 p-6 md:p-8 ${index === 0 ? "bg-stone-950 text-[#fffdf7]" : "bg-[#fffdf7]"}`}><Icon size={26} className={index === 0 ? "text-[#d3ad68]" : "text-[#1f6b4d]"} /><h2 className="mt-16 text-2xl font-semibold tracking-tight">{item.title}</h2><p className={`mt-3 max-w-[55ch] text-sm leading-6 ${index === 0 ? "text-stone-400" : "text-stone-600"}`}>{item.body}</p></article>;
+          })}
         </section>
 
-        <section className="mt-16">
-          <SectionLabel kicker="Rank Race" title="The top 50 did not arrive in a straight line." />
-          <div className="panel rounded-lg p-5">
-            <AnimatedRankRace data={lab.race} />
-          </div>
-        </section>
-
-        <section className="mt-16 grid grid-cols-1 gap-5 lg:grid-cols-2">
-          <div>
-            <SectionLabel kicker="Consistency" title="Average points versus volatility." />
-            <div className="panel rounded-lg p-5">
-              <ConsistencyScatter data={lab.scatter} />
-            </div>
-          </div>
-          <div>
-            <SectionLabel kicker="Value" title="Team value versus final rank." />
-            <div className="panel rounded-lg p-5">
-              <ValueRankScatter data={lab.scatter} />
-            </div>
-          </div>
-        </section>
-
-        <section className="mt-16 grid grid-cols-1 gap-5 lg:grid-cols-2">
-          <CompactManagerTable title="Bench Pain Hall of Fame" rows={lab.benchPain} metricLabel="bench" metricKey="bench_points" />
-          <CompactManagerTable title="Biggest GW Explosions" rows={lab.explosions} metricLabel="points" metricKey="points" />
-        </section>
-
-        <section className="mt-16 panel rounded-lg">
-          <div className="border-b border-stone-950/10 p-5">
-            <h2 className="text-xl font-semibold tracking-tight">Top 100 weekly explosions</h2>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[860px] text-left text-sm">
-              <thead className="border-b border-stone-950/10 text-xs uppercase tracking-[0.16em] text-stone-500">
-                <tr>
-                  <th className="px-5 py-3">GW</th>
-                  <th className="px-5 py-3">Team</th>
-                  <th className="px-5 py-3">Manager</th>
-                  <th className="px-5 py-3 text-right">Points</th>
-                  <th className="px-5 py-3 text-right">Final rank</th>
-                  <th className="px-5 py-3 text-right">Bench</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-stone-950/10">
-                {lab.explosions.map((row) => (
-                  <tr key={`${row.event}-${row.entry}`}>
-                    <td className="mono-num px-5 py-3">GW{String(row.event)}</td>
-                    <td className="px-5 py-3">
-                      <Link href={`/managers/${row.entry}`} className="font-semibold hover:text-[#1f6b4d]">
-                        {primaryManagerName(row)}
-                      </Link>
-                    </td>
-                    <td className="px-5 py-3 text-stone-600">{row.player_name}</td>
-                    <td className="mono-num px-5 py-3 text-right font-semibold">{row.points}</td>
-                    <td className="mono-num px-5 py-3 text-right">#{nf.format(Number(row.final_rank))}</td>
-                    <td className="mono-num px-5 py-3 text-right">{row.points_on_bench}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+        <section className="mt-16 grid gap-8 border-t border-stone-950/10 pt-10 md:grid-cols-[0.65fr_0.35fr]">
+          <div><div className="font-mono text-xs uppercase tracking-[0.2em] text-[#1f6b4d]">Current notebook</div><h2 className="mt-3 text-3xl font-semibold">Why content facts carry their own lineage.</h2><p className="mt-4 max-w-[65ch] leading-7 text-stone-600">A gameweek number is useful only when we know whether it was live or final, which managers it represents, when it was calculated, and which snapshot can reproduce it.</p></div>
+          <Link href="/stories" className="group flex min-h-44 flex-col justify-between bg-[#e9eee8] p-6 md:rounded-[0.75rem]"><span className="text-sm font-semibold">See it in the weekly report</span><ArrowRight size={22} className="text-[#1f6b4d] transition group-hover:translate-x-1" /></Link>
         </section>
       </main>
+      <SiteFooter />
     </>
   );
 }

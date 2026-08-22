@@ -1,0 +1,11 @@
+[Unit]
+Description=FPL Kenya bootstrap and fixture refresh
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=codex
+Group=codex
+WorkingDirectory=/opt/fplke
+EnvironmentFile=/opt/fplke/.env
+ExecStart=/opt/fplke/.venv/bin/python /opt/fplke/fplke_pipeline.py bootstrap

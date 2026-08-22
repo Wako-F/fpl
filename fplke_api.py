@@ -3,7 +3,7 @@ import os
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from redis.asyncio import Redis
 
@@ -44,17 +44,34 @@ def redis() -> Redis:
 
 async def cached(key: str, ttl: int, loader):
     client = redis()
-    cached_value = await client.get(key)
-    if cached_value:
-        return json.loads(cached_value)
+    try:
+        cached_value = await client.get(key)
+        if cached_value:
+            return json.loads(cached_value)
+    except Exception:
+        # The database remains authoritative; Redis is an acceleration layer.
+        cached_value = None
     value = await loader()
-    await client.setex(key, ttl, json.dumps(jsonable_encoder(value), separators=(",", ":")))
+    try:
+        await client.setex(key, ttl, json.dumps(jsonable_encoder(value), separators=(",", ":")))
+    except Exception:
+        pass
     return value
 
 
 async def fetchrow(query: str, *args):
     async with pool().acquire() as conn:
         return await conn.fetchrow(query, *args)
+
+
+async def resolve_season(season: str | None) -> str:
+    if season and season != "active":
+        value = await pool().fetchval("SELECT id FROM seasons WHERE id=$1", season)
+    else:
+        value = await pool().fetchval("SELECT id FROM seasons WHERE is_active LIMIT 1")
+    if not value:
+        raise HTTPException(status_code=404, detail="Season not found")
+    return value
 
 
 @app.get("/health")
@@ -574,3 +591,321 @@ async def stories():
             }
 
     return await cached("stories:v1", 21600, load)
+
+
+# Season-aware 2026/27 API. Legacy routes above remain available for the
+# 2025/26 archive while the frontend migrates to this contract.
+
+
+@app.get("/v2/seasons")
+async def seasons_v2():
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.id,s.label,s.starts_year,s.ends_year,s.is_active,s.country_league_id,
+                   count(DISTINCT e.event)::integer AS events_loaded,
+                   max(ss.captured_at) AS latest_standings_at
+            FROM seasons s
+            LEFT JOIN fpl_events e ON e.season_id=s.id
+            LEFT JOIN standings_snapshots ss ON ss.season_id=s.id
+            GROUP BY s.id ORDER BY s.starts_year DESC
+            """
+        )
+        return [dict(row) for row in rows]
+
+
+@app.get("/v2/status")
+async def status_v2(season: str | None = None):
+    season_id = await resolve_season(season)
+    async with pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                $1::text AS season_id,
+                (SELECT event FROM fpl_events WHERE season_id=$1 AND is_current LIMIT 1) AS current_event,
+                (SELECT count(*) FROM fpl_players WHERE season_id=$1)::integer AS players,
+                (SELECT count(*) FROM fpl_teams WHERE season_id=$1)::integer AS teams,
+                (SELECT count(*) FROM vw_latest_standings WHERE season_id=$1)::integer AS standings_rows,
+                (SELECT captured_at FROM vw_latest_standings_snapshot WHERE season_id=$1) AS standings_updated_at,
+                (SELECT max(updated_at) FROM player_event_live_v2 WHERE season_id=$1) AS live_updated_at,
+                (SELECT status FROM pipeline_runs WHERE season_id=$1 ORDER BY started_at DESC LIMIT 1) AS pipeline_status,
+                (SELECT started_at FROM pipeline_runs WHERE season_id=$1 ORDER BY started_at DESC LIMIT 1) AS pipeline_started_at
+            """,
+            season_id,
+        )
+        quality = await conn.fetch(
+            """
+            SELECT DISTINCT ON (check_name) check_name,status,observed_value,expected_value,checked_at
+            FROM data_quality_results WHERE season_id=$1
+            ORDER BY check_name,checked_at DESC
+            """,
+            season_id,
+        )
+        return {**dict(row), "quality": [dict(item) for item in quality]}
+
+
+@app.get("/v2/overview")
+async def overview_v2(season: str | None = None):
+    season_id = await resolve_season(season)
+
+    async def load():
+        async with pool().acquire() as conn:
+            season_row = await conn.fetchrow("SELECT * FROM seasons WHERE id=$1", season_id)
+            event = await conn.fetchrow(
+                """
+                SELECT * FROM fpl_events WHERE season_id=$1
+                ORDER BY is_current DESC,is_previous DESC,event DESC LIMIT 1
+                """,
+                season_id,
+            )
+            snapshot = await conn.fetchrow(
+                "SELECT * FROM vw_latest_standings_snapshot WHERE season_id=$1", season_id
+            )
+            summary = None
+            leaders = []
+            if snapshot:
+                summary = await conn.fetchrow(
+                    """
+                    SELECT count(*)::integer AS managers,min(total)::integer AS min_points,
+                           max(total)::integer AS max_points,round(avg(total),2) AS avg_points,
+                           percentile_cont(0.5) WITHIN GROUP (ORDER BY total)::numeric(10,2) AS median_points,
+                           percentile_cont(0.9) WITHIN GROUP (ORDER BY total)::numeric(10,2) AS p90_points,
+                           percentile_cont(0.99) WITHIN GROUP (ORDER BY total)::numeric(10,2) AS p99_points
+                    FROM standings_snapshot_rows WHERE snapshot_id=$1
+                    """,
+                    snapshot["id"],
+                )
+                leaders = await conn.fetch(
+                    """
+                    SELECT entry,entry_name,player_name,rank,last_rank,total,event_total
+                    FROM standings_snapshot_rows WHERE snapshot_id=$1
+                    ORDER BY rank NULLS LAST LIMIT 10
+                    """,
+                    snapshot["id"],
+                )
+            cohort = await conn.fetchrow(
+                """
+                SELECT count(*)::integer AS managers,round(avg(points),2) AS avg_points,
+                       percentile_cont(0.5) WITHIN GROUP (ORDER BY points)::numeric(10,2) AS median_points,
+                       max(points)::integer AS max_points,round(avg(points_on_bench),2) AS avg_bench_points,
+                       round(avg(event_transfers_cost),2) AS avg_transfer_cost
+                FROM manager_event_history_v2 WHERE season_id=$1 AND event=$2
+                """,
+                season_id,
+                event["event"] if event else 0,
+            )
+            top_players = await conn.fetch(
+                """
+                SELECT l.element,p.web_name,t.short_name,l.total_points,l.minutes,l.goals_scored,
+                       l.assists,l.bonus,l.bps,l.defensive_contribution
+                FROM player_event_live_v2 l
+                JOIN fpl_players p ON p.season_id=l.season_id AND p.element=l.element
+                JOIN fpl_teams t ON t.season_id=p.season_id AND t.team_id=p.team_id
+                WHERE l.season_id=$1 AND l.event=$2
+                ORDER BY l.total_points DESC,l.bps DESC LIMIT 10
+                """,
+                season_id,
+                event["event"] if event else 0,
+            )
+            fixtures = await conn.fetch(
+                """
+                SELECT f.fixture_id,f.event,f.kickoff_time,f.finished,f.started,
+                       h.name AS team_h_name,h.short_name AS team_h_short,f.team_h_score,
+                       a.name AS team_a_name,a.short_name AS team_a_short,f.team_a_score
+                FROM fpl_fixtures f
+                JOIN fpl_teams h ON h.season_id=f.season_id AND h.team_id=f.team_h
+                JOIN fpl_teams a ON a.season_id=f.season_id AND a.team_id=f.team_a
+                WHERE f.season_id=$1 AND f.event=$2 ORDER BY f.kickoff_time
+                """,
+                season_id,
+                event["event"] if event else 0,
+            )
+            return {
+                "season": dict(season_row),
+                "event": dict(event) if event else None,
+                "snapshot": dict(snapshot) if snapshot else None,
+                "summary": dict(summary) if summary else None,
+                "cohort": dict(cohort),
+                "leaders": [dict(row) for row in leaders],
+                "topPlayers": [dict(row) for row in top_players],
+                "fixtures": [dict(row) for row in fixtures],
+            }
+
+    return await cached(f"v2:overview:{season_id}:v1", 120, load)
+
+
+@app.get("/v2/leaderboard")
+async def leaderboard_v2(
+    season: str | None = None,
+    q: str = "",
+    limit: int = Query(default=50, ge=1, le=500),
+):
+    season_id = await resolve_season(season)
+    q = q.strip()
+    async with pool().acquire() as conn:
+        snapshot_id = await conn.fetchval(
+            "SELECT id FROM vw_latest_standings_snapshot WHERE season_id=$1", season_id
+        )
+        if not snapshot_id:
+            return {"snapshot": None, "rows": []}
+        if q:
+            rows = await conn.fetch(
+                """
+                SELECT entry,entry_name,player_name,rank,last_rank,total,event_total,
+                       (last_rank-rank)::integer AS rank_gain
+                FROM standings_snapshot_rows
+                WHERE snapshot_id=$1 AND
+                      (entry_name ILIKE '%'||$2||'%' OR player_name ILIKE '%'||$2||'%' OR entry::text=$2)
+                ORDER BY rank NULLS LAST LIMIT $3
+                """,
+                snapshot_id,
+                q,
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT entry,entry_name,player_name,rank,last_rank,total,event_total,
+                       (last_rank-rank)::integer AS rank_gain
+                FROM standings_snapshot_rows WHERE snapshot_id=$1
+                ORDER BY rank NULLS LAST LIMIT $2
+                """,
+                snapshot_id,
+                limit,
+            )
+        snapshot = await conn.fetchrow("SELECT * FROM standings_snapshots WHERE id=$1", snapshot_id)
+        return {"snapshot": dict(snapshot), "rows": [dict(row) for row in rows]}
+
+
+@app.get("/v2/players")
+async def players_v2(
+    season: str | None = None,
+    event: int | None = None,
+    sort: str = Query(default="points", pattern="^(points|ownership|transfers|defensive|bps)$"),
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    season_id = await resolve_season(season)
+    if event is None:
+        event = await pool().fetchval(
+            "SELECT event FROM fpl_events WHERE season_id=$1 AND is_current LIMIT 1", season_id
+        )
+    order = {
+        "points": "COALESCE(l.total_points,p.event_points) DESC",
+        "ownership": "p.selected_by_percent DESC NULLS LAST",
+        "transfers": "((p.raw->>'transfers_in_event')::integer-(p.raw->>'transfers_out_event')::integer) DESC NULLS LAST",
+        "defensive": "COALESCE(l.defensive_contribution,p.defensive_contribution) DESC NULLS LAST",
+        "bps": "l.bps DESC NULLS LAST",
+    }[sort]
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT p.element,p.web_name,p.first_name,p.second_name,t.name AS team_name,t.short_name,
+                   p.element_type,p.now_cost,p.status,p.selected_by_percent,p.total_points,
+                   p.event_points,p.form,p.points_per_game,p.expected_goals,p.expected_assists,
+                   p.expected_goal_involvements,p.defensive_contribution,p.price_change_projection,
+                   l.total_points AS live_points,l.minutes,l.goals_scored,l.assists,l.bonus,l.bps,
+                   l.defensive_contribution AS live_defensive_contribution,
+                   (p.raw->>'transfers_in_event')::integer AS transfers_in_event,
+                   (p.raw->>'transfers_out_event')::integer AS transfers_out_event
+            FROM fpl_players p
+            JOIN fpl_teams t ON t.season_id=p.season_id AND t.team_id=p.team_id
+            LEFT JOIN player_event_live_v2 l ON l.season_id=p.season_id AND l.element=p.element AND l.event=$2
+            WHERE p.season_id=$1 ORDER BY {order},p.web_name LIMIT $3
+            """,
+            season_id,
+            event,
+            limit,
+        )
+        return {"season": season_id, "event": event, "sort": sort, "rows": [dict(row) for row in rows]}
+
+
+@app.get("/v2/managers/{entry}")
+async def manager_v2(entry: int, season: str | None = None):
+    season_id = await resolve_season(season)
+    async with pool().acquire() as conn:
+        snapshot_id = await conn.fetchval(
+            "SELECT id FROM vw_latest_standings_snapshot WHERE season_id=$1", season_id
+        )
+        manager = await conn.fetchrow(
+            """
+            SELECT s.entry,s.entry_name,s.player_name,s.rank,s.last_rank,s.total,s.event_total,
+                   p.player_region_name,p.summary_overall_rank,p.summary_overall_points,p.favourite_team
+            FROM standings_snapshot_rows s
+            LEFT JOIN manager_profiles_v2 p ON p.season_id=s.season_id AND p.entry=s.entry
+            WHERE s.snapshot_id=$1 AND s.entry=$2
+            """,
+            snapshot_id,
+            entry,
+        ) if snapshot_id else None
+        if not manager:
+            raise HTTPException(status_code=404, detail="Manager is not present in the latest captured cohort")
+        history = await conn.fetch(
+            """
+            SELECT event,points,total_points,overall_rank,bank,team_value AS value,
+                   event_transfers,event_transfers_cost,points_on_bench
+            FROM manager_event_history_v2 WHERE season_id=$1 AND entry=$2 ORDER BY event
+            """,
+            season_id,
+            entry,
+        )
+        metrics = await conn.fetchrow(
+            "SELECT * FROM vw_manager_event_metrics WHERE season_id=$1 AND entry=$2",
+            season_id,
+            entry,
+        )
+        chips = await conn.fetch(
+            "SELECT chip_name,event FROM manager_chips_v2 WHERE season_id=$1 AND entry=$2 ORDER BY event",
+            season_id,
+            entry,
+        )
+        return {
+            "season": season_id,
+            "manager": dict(manager),
+            "metrics": dict(metrics) if metrics else None,
+            "history": [dict(row) for row in history],
+            "chips": [dict(row) for row in chips],
+        }
+
+
+@app.get("/v2/gameweeks/{event}/content")
+async def content_v2(event: int, season: str | None = None):
+    season_id = await resolve_season(season)
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (fact_key) fact_key,status,value,cohort,sample_size,
+                   calculated_at,methodology,source_snapshot_id
+            FROM content_facts WHERE season_id=$1 AND event=$2
+            ORDER BY fact_key,calculated_at DESC
+            """,
+            season_id,
+            event,
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="The weekly content pack has not been generated")
+        return {
+            "season": season_id,
+            "event": event,
+            "facts": {row["fact_key"]: dict(row) for row in rows},
+        }
+
+
+@app.get("/v2/gameweeks/{event}/fixtures")
+async def fixtures_v2(event: int, season: str | None = None):
+    season_id = await resolve_season(season)
+    async with pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT f.fixture_id,f.kickoff_time,f.finished,f.started,
+                   h.name AS team_h_name,h.short_name AS team_h_short,f.team_h_score,
+                   a.name AS team_a_name,a.short_name AS team_a_short,f.team_a_score,
+                   f.difficulty_h,f.difficulty_a
+            FROM fpl_fixtures f
+            JOIN fpl_teams h ON h.season_id=f.season_id AND h.team_id=f.team_h
+            JOIN fpl_teams a ON a.season_id=f.season_id AND a.team_id=f.team_a
+            WHERE f.season_id=$1 AND f.event=$2 ORDER BY f.kickoff_time
+            """,
+            season_id,
+            event,
+        )
+        return [dict(row) for row in rows]

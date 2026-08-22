@@ -9,7 +9,7 @@ import { primaryManagerName, secondaryManagerName } from "@/lib/display";
 const nf = new Intl.NumberFormat("en-US");
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 
-export function LeaderboardSearch({ initialRows }: { initialRows: LeaderboardRow[] }) {
+export function LeaderboardSearch({ initialRows, event }: { initialRows: LeaderboardRow[]; event: number }) {
   const [query, setQuery] = useState("");
   const [rows, setRows] = useState(initialRows);
   const [loading, setLoading] = useState(false);
@@ -76,7 +76,7 @@ export function LeaderboardSearch({ initialRows }: { initialRows: LeaderboardRow
               <th className="px-5 py-3 font-semibold">Team</th>
               <th className="px-5 py-3 font-semibold">Manager</th>
               <th className="px-5 py-3 text-right font-semibold">Total</th>
-              <th className="px-5 py-3 text-right font-semibold">GW38</th>
+              <th className="px-5 py-3 text-right font-semibold">GW{event}</th>
               <th className="px-5 py-3 text-right font-semibold">Move</th>
             </tr>
           </thead>

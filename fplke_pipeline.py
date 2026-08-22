@@ -1,0 +1,684 @@
+"""Season-aware FPL Kenya ingestion pipeline.
+
+This collector intentionally defaults to a bounded deep cohort. Use
+``--max-pages 0`` only after confirming the operational and data-use policy for
+a complete country-league crawl.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import random
+import sys
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from typing import Any, Awaitable, Callable, Iterable
+
+import asyncpg
+import httpx
+
+from fplke_settings import settings
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+@dataclass
+class FetchResult:
+    url: str
+    status_code: int
+    payload: Any
+
+
+class SeasonPipeline:
+    def __init__(self, db: asyncpg.Pool, concurrency: int, pause: float):
+        self.db = db
+        self.sem = asyncio.Semaphore(concurrency)
+        self.pause = pause
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(45),
+            follow_redirects=True,
+            headers={"Accept": "application/json", "User-Agent": settings.user_agent},
+        )
+
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def fetch(self, path: str, attempts: int = 5) -> FetchResult:
+        url = path if path.startswith("http") else f"{settings.base_url}{path}"
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self.sem:
+                    response = await self.client.get(url)
+            except httpx.HTTPError:
+                if attempt == attempts:
+                    raise
+                await asyncio.sleep(min(60, 2**attempt + random.random()))
+                continue
+
+            if response.status_code == 200:
+                if self.pause:
+                    await asyncio.sleep(self.pause)
+                return FetchResult(url, response.status_code, response.json())
+            if response.status_code in {403, 404}:
+                return FetchResult(url, response.status_code, {"detail": response.text[:500]})
+            if attempt == attempts:
+                response.raise_for_status()
+            await asyncio.sleep(min(60, 2**attempt + random.random()))
+        raise RuntimeError(f"Unable to fetch {url}")
+
+    async def store_raw(
+        self,
+        result: FetchResult,
+        resource_type: str,
+        resource_id: str | int,
+        *,
+        event: int | None = None,
+        page: int | None = None,
+    ) -> None:
+        encoded = json_dumps(result.payload)
+        digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+        await self.db.execute(
+            """
+            INSERT INTO raw_snapshots
+                (season_id, resource_type, resource_id, event, page, url,
+                 status_code, payload_sha256, payload)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+            """,
+            settings.season_id,
+            resource_type,
+            str(resource_id),
+            event,
+            page,
+            result.url,
+            result.status_code,
+            digest,
+            encoded,
+        )
+
+    async def sync_bootstrap(self) -> dict[str, Any]:
+        result = await self.fetch("/bootstrap-static/")
+        await self.store_raw(result, "bootstrap", "latest")
+        bootstrap = result.payload
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                for event in bootstrap.get("events", []):
+                    await conn.execute(
+                        """
+                        INSERT INTO fpl_events
+                            (season_id,event,name,deadline_time,is_previous,is_current,is_next,
+                             finished,data_checked,average_entry_score,highest_score,ranked_count,
+                             chip_plays,raw,updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,now())
+                        ON CONFLICT (season_id,event) DO UPDATE SET
+                            name=EXCLUDED.name, deadline_time=EXCLUDED.deadline_time,
+                            is_previous=EXCLUDED.is_previous, is_current=EXCLUDED.is_current,
+                            is_next=EXCLUDED.is_next, finished=EXCLUDED.finished,
+                            data_checked=EXCLUDED.data_checked,
+                            average_entry_score=EXCLUDED.average_entry_score,
+                            highest_score=EXCLUDED.highest_score, ranked_count=EXCLUDED.ranked_count,
+                            chip_plays=EXCLUDED.chip_plays, raw=EXCLUDED.raw, updated_at=now()
+                        """,
+                        settings.season_id,
+                        event["id"],
+                        event["name"],
+                        event["deadline_time"],
+                        event.get("is_previous", False),
+                        event.get("is_current", False),
+                        event.get("is_next", False),
+                        event.get("finished", False),
+                        event.get("data_checked", False),
+                        event.get("average_entry_score"),
+                        event.get("highest_score"),
+                        event.get("ranked_count"),
+                        json_dumps(event.get("chip_plays", [])),
+                        json_dumps(event),
+                    )
+
+                for team in bootstrap.get("teams", []):
+                    await conn.execute(
+                        """
+                        INSERT INTO fpl_teams
+                            (season_id,team_id,name,short_name,code,strength,raw,updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,now())
+                        ON CONFLICT (season_id,team_id) DO UPDATE SET
+                            name=EXCLUDED.name, short_name=EXCLUDED.short_name,
+                            code=EXCLUDED.code, strength=EXCLUDED.strength,
+                            raw=EXCLUDED.raw, updated_at=now()
+                        """,
+                        settings.season_id,
+                        team["id"],
+                        team["name"],
+                        team["short_name"],
+                        team.get("code"),
+                        team.get("strength"),
+                        json_dumps(team),
+                    )
+
+                for player in bootstrap.get("elements", []):
+                    projection = player.get("price_change_projections")
+                    await conn.execute(
+                        """
+                        INSERT INTO fpl_players
+                            (season_id,element,team_id,element_type,web_name,first_name,second_name,
+                             now_cost,status,selected_by_percent,total_points,event_points,form,
+                             points_per_game,expected_goals,expected_assists,
+                             expected_goal_involvements,expected_goals_conceded,
+                             defensive_contribution,price_change_projection,raw,updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                                $18,$19,$20::jsonb,$21::jsonb,now())
+                        ON CONFLICT (season_id,element) DO UPDATE SET
+                            team_id=EXCLUDED.team_id, element_type=EXCLUDED.element_type,
+                            web_name=EXCLUDED.web_name, first_name=EXCLUDED.first_name,
+                            second_name=EXCLUDED.second_name, now_cost=EXCLUDED.now_cost,
+                            status=EXCLUDED.status, selected_by_percent=EXCLUDED.selected_by_percent,
+                            total_points=EXCLUDED.total_points, event_points=EXCLUDED.event_points,
+                            form=EXCLUDED.form, points_per_game=EXCLUDED.points_per_game,
+                            expected_goals=EXCLUDED.expected_goals,
+                            expected_assists=EXCLUDED.expected_assists,
+                            expected_goal_involvements=EXCLUDED.expected_goal_involvements,
+                            expected_goals_conceded=EXCLUDED.expected_goals_conceded,
+                            defensive_contribution=EXCLUDED.defensive_contribution,
+                            price_change_projection=EXCLUDED.price_change_projection,
+                            raw=EXCLUDED.raw, updated_at=now()
+                        """,
+                        settings.season_id,
+                        player["id"],
+                        player["team"],
+                        player["element_type"],
+                        player["web_name"],
+                        player.get("first_name"),
+                        player.get("second_name"),
+                        player["now_cost"],
+                        player.get("status"),
+                        decimal_or_none(player.get("selected_by_percent")),
+                        player.get("total_points", 0),
+                        player.get("event_points", 0),
+                        decimal_or_none(player.get("form")),
+                        decimal_or_none(player.get("points_per_game")),
+                        decimal_or_none(player.get("expected_goals")),
+                        decimal_or_none(player.get("expected_assists")),
+                        decimal_or_none(player.get("expected_goal_involvements")),
+                        decimal_or_none(player.get("expected_goals_conceded")),
+                        player.get("defensive_contribution"),
+                        json_dumps(projection) if projection is not None else None,
+                        json_dumps(player),
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO price_snapshots
+                            (season_id,element,now_cost,transfers_in_event,transfers_out_event,
+                             selected_by_percent,projection)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+                        """,
+                        settings.season_id,
+                        player["id"],
+                        player["now_cost"],
+                        player.get("transfers_in_event", 0),
+                        player.get("transfers_out_event", 0),
+                        decimal_or_none(player.get("selected_by_percent")),
+                        json_dumps(projection) if projection is not None else None,
+                    )
+
+        fixtures_result = await self.fetch("/fixtures/")
+        await self.store_raw(fixtures_result, "fixtures", "latest")
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                for fixture in fixtures_result.payload:
+                    await conn.execute(
+                        """
+                        INSERT INTO fpl_fixtures
+                            (season_id,fixture_id,event,kickoff_time,team_h,team_a,team_h_score,
+                             team_a_score,finished,started,difficulty_h,difficulty_a,raw,updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,now())
+                        ON CONFLICT (season_id,fixture_id) DO UPDATE SET
+                            event=EXCLUDED.event,kickoff_time=EXCLUDED.kickoff_time,
+                            team_h_score=EXCLUDED.team_h_score,team_a_score=EXCLUDED.team_a_score,
+                            finished=EXCLUDED.finished,started=EXCLUDED.started,
+                            difficulty_h=EXCLUDED.difficulty_h,difficulty_a=EXCLUDED.difficulty_a,
+                            raw=EXCLUDED.raw,updated_at=now()
+                        """,
+                        settings.season_id,
+                        fixture["id"],
+                        fixture.get("event"),
+                        fixture.get("kickoff_time"),
+                        fixture["team_h"],
+                        fixture["team_a"],
+                        fixture.get("team_h_score"),
+                        fixture.get("team_a_score"),
+                        fixture.get("finished", False),
+                        fixture.get("started", False),
+                        fixture.get("team_h_difficulty"),
+                        fixture.get("team_a_difficulty"),
+                        json_dumps(fixture),
+                    )
+
+        return {
+            "events": len(bootstrap.get("events", [])),
+            "teams": len(bootstrap.get("teams", [])),
+            "players": len(bootstrap.get("elements", [])),
+            "fixtures": len(fixtures_result.payload),
+            "current_event": next(
+                (row["id"] for row in bootstrap.get("events", []) if row.get("is_current")), None
+            ),
+        }
+
+    async def current_event(self) -> int | None:
+        return await self.db.fetchval(
+            "SELECT event FROM fpl_events WHERE season_id=$1 AND is_current ORDER BY event DESC LIMIT 1",
+            settings.season_id,
+        )
+
+    async def sync_event_live(self, event: int) -> dict[str, int]:
+        result = await self.fetch(f"/event/{event}/live/")
+        await self.store_raw(result, "event_live", event, event=event)
+        if result.status_code != 200:
+            return {"event": event, "players": 0}
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                for row in result.payload.get("elements", []):
+                    stats = row.get("stats", {})
+                    await conn.execute(
+                        """
+                        INSERT INTO player_event_live_v2
+                            (season_id,event,element,total_points,minutes,goals_scored,assists,
+                             clean_sheets,saves,bonus,bps,defensive_contribution,
+                             expected_goals,expected_assists,raw,updated_at)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,now())
+                        ON CONFLICT (season_id,event,element) DO UPDATE SET
+                            total_points=EXCLUDED.total_points,minutes=EXCLUDED.minutes,
+                            goals_scored=EXCLUDED.goals_scored,assists=EXCLUDED.assists,
+                            clean_sheets=EXCLUDED.clean_sheets,saves=EXCLUDED.saves,
+                            bonus=EXCLUDED.bonus,bps=EXCLUDED.bps,
+                            defensive_contribution=EXCLUDED.defensive_contribution,
+                            expected_goals=EXCLUDED.expected_goals,
+                            expected_assists=EXCLUDED.expected_assists,
+                            raw=EXCLUDED.raw,updated_at=now()
+                        """,
+                        settings.season_id,
+                        event,
+                        row["id"],
+                        stats.get("total_points", 0),
+                        stats.get("minutes", 0),
+                        stats.get("goals_scored", 0),
+                        stats.get("assists", 0),
+                        stats.get("clean_sheets", 0),
+                        stats.get("saves", 0),
+                        stats.get("bonus", 0),
+                        stats.get("bps", 0),
+                        stats.get("defensive_contribution", 0),
+                        decimal_or_none(stats.get("expected_goals")),
+                        decimal_or_none(stats.get("expected_assists")),
+                        json_dumps(row),
+                    )
+        return {"event": event, "players": len(result.payload.get("elements", []))}
+
+    async def sync_standings(self, max_pages: int | None) -> dict[str, Any]:
+        event = await self.current_event()
+        snapshot_id = await self.db.fetchval(
+            """
+            INSERT INTO standings_snapshots (season_id,event,source_note)
+            VALUES ($1,$2,$3) RETURNING id
+            """,
+            settings.season_id,
+            event,
+            "Official country league; bounded crawl" if max_pages else "Official country league; complete crawl",
+        )
+        page = 1
+        rows_collected = 0
+        has_next = True
+        while has_next and (max_pages is None or page <= max_pages):
+            result = await self.fetch(
+                f"/leagues-classic/{settings.league_id}/standings/?page_standings={page}"
+            )
+            await self.store_raw(result, "kenya_standings", page, event=event, page=page)
+            if result.status_code != 200:
+                raise RuntimeError(f"Standings page {page} returned {result.status_code}")
+            standings = result.payload.get("standings", {})
+            rows = standings.get("results", [])
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    await conn.executemany(
+                        """
+                        INSERT INTO standings_snapshot_rows
+                            (snapshot_id,season_id,event,page,entry,entry_name,player_name,rank,
+                             last_rank,total,event_total,has_played,raw)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+                        ON CONFLICT (snapshot_id,entry) DO NOTHING
+                        """,
+                        [
+                            (
+                                snapshot_id,
+                                settings.season_id,
+                                event,
+                                page,
+                                row["entry"],
+                                row.get("entry_name"),
+                                row.get("player_name"),
+                                row.get("rank"),
+                                row.get("last_rank"),
+                                row.get("total"),
+                                row.get("event_total"),
+                                row.get("has_played"),
+                                json_dumps(row),
+                            )
+                            for row in rows
+                        ],
+                    )
+            rows_collected += len(rows)
+            has_next = bool(standings.get("has_next"))
+            print(f"standings page={page} rows={len(rows)} has_next={has_next}", flush=True)
+            page += 1
+
+        is_complete = not has_next
+        pages_collected = page - 1
+        await self.db.execute(
+            """
+            UPDATE standings_snapshots
+            SET is_complete=$2,pages_collected=$3,managers_collected=$4
+            WHERE id=$1
+            """,
+            snapshot_id,
+            is_complete,
+            pages_collected,
+            rows_collected,
+        )
+        return {
+            "snapshot_id": snapshot_id,
+            "event": event,
+            "pages": pages_collected,
+            "managers": rows_collected,
+            "is_complete": is_complete,
+        }
+
+    async def cohort_entries(self, limit: int) -> list[int]:
+        rows = await self.db.fetch(
+            """
+            SELECT entry FROM vw_latest_standings
+            WHERE season_id=$1 ORDER BY rank NULLS LAST LIMIT $2
+            """,
+            settings.season_id,
+            limit,
+        )
+        return [row["entry"] for row in rows]
+
+    async def sync_manager(self, entry: int, event: int | None, include_picks: bool) -> None:
+        profile_result, history_result = await asyncio.gather(
+            self.fetch(f"/entry/{entry}/"),
+            self.fetch(f"/entry/{entry}/history/"),
+        )
+        await self.store_raw(profile_result, "manager_profile", entry)
+        await self.store_raw(history_result, "manager_history", entry)
+        if profile_result.status_code == 200:
+            profile = profile_result.payload
+            await self.db.execute(
+                """
+                INSERT INTO manager_profiles_v2
+                    (season_id,entry,player_first_name,player_last_name,player_region_id,
+                     player_region_name,favourite_team,summary_overall_points,
+                     summary_overall_rank,summary_event_points,current_event,raw,updated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,now())
+                ON CONFLICT (season_id,entry) DO UPDATE SET
+                    player_first_name=EXCLUDED.player_first_name,
+                    player_last_name=EXCLUDED.player_last_name,
+                    player_region_id=EXCLUDED.player_region_id,
+                    player_region_name=EXCLUDED.player_region_name,
+                    favourite_team=EXCLUDED.favourite_team,
+                    summary_overall_points=EXCLUDED.summary_overall_points,
+                    summary_overall_rank=EXCLUDED.summary_overall_rank,
+                    summary_event_points=EXCLUDED.summary_event_points,
+                    current_event=EXCLUDED.current_event,raw=EXCLUDED.raw,updated_at=now()
+                """,
+                settings.season_id,
+                entry,
+                profile.get("player_first_name"),
+                profile.get("player_last_name"),
+                profile.get("player_region_id"),
+                profile.get("player_region_name"),
+                profile.get("favourite_team"),
+                profile.get("summary_overall_points"),
+                profile.get("summary_overall_rank"),
+                profile.get("summary_event_points"),
+                profile.get("current_event"),
+                json_dumps(profile),
+            )
+
+        if history_result.status_code == 200:
+            history = history_result.payload
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    for row in history.get("current", []):
+                        await conn.execute(
+                            """
+                            INSERT INTO manager_event_history_v2
+                                (season_id,entry,event,points,total_points,overall_rank,
+                                 percentile_rank,bank,team_value,event_transfers,
+                                 event_transfers_cost,points_on_bench,raw,updated_at)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,now())
+                            ON CONFLICT (season_id,entry,event) DO UPDATE SET
+                                points=EXCLUDED.points,total_points=EXCLUDED.total_points,
+                                overall_rank=EXCLUDED.overall_rank,
+                                percentile_rank=EXCLUDED.percentile_rank,bank=EXCLUDED.bank,
+                                team_value=EXCLUDED.team_value,event_transfers=EXCLUDED.event_transfers,
+                                event_transfers_cost=EXCLUDED.event_transfers_cost,
+                                points_on_bench=EXCLUDED.points_on_bench,
+                                raw=EXCLUDED.raw,updated_at=now()
+                            """,
+                            settings.season_id,
+                            entry,
+                            row["event"],
+                            row.get("points"),
+                            row.get("total_points"),
+                            row.get("overall_rank"),
+                            row.get("percentile_rank"),
+                            row.get("bank"),
+                            row.get("value"),
+                            row.get("event_transfers"),
+                            row.get("event_transfers_cost"),
+                            row.get("points_on_bench"),
+                            json_dumps(row),
+                        )
+                    for chip in history.get("chips", []):
+                        await conn.execute(
+                            """
+                            INSERT INTO manager_chips_v2
+                                (season_id,entry,chip_name,event,raw,updated_at)
+                            VALUES ($1,$2,$3,$4,$5::jsonb,now())
+                            ON CONFLICT (season_id,entry,chip_name,event) DO UPDATE SET
+                                raw=EXCLUDED.raw,updated_at=now()
+                            """,
+                            settings.season_id,
+                            entry,
+                            chip["name"],
+                            chip["event"],
+                            json_dumps(chip),
+                        )
+
+        if include_picks and event:
+            picks_result = await self.fetch(f"/entry/{entry}/event/{event}/picks/")
+            await self.store_raw(picks_result, "manager_picks", f"{entry}:{event}", event=event)
+            if picks_result.status_code == 200:
+                async with self.db.acquire() as conn:
+                    async with conn.transaction():
+                        for pick in picks_result.payload.get("picks", []):
+                            await conn.execute(
+                                """
+                                INSERT INTO manager_picks_v2
+                                    (season_id,entry,event,element,position,multiplier,
+                                     is_captain,is_vice_captain,raw,updated_at)
+                                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,now())
+                                ON CONFLICT (season_id,entry,event,position) DO UPDATE SET
+                                    element=EXCLUDED.element,multiplier=EXCLUDED.multiplier,
+                                    is_captain=EXCLUDED.is_captain,
+                                    is_vice_captain=EXCLUDED.is_vice_captain,
+                                    raw=EXCLUDED.raw,updated_at=now()
+                                """,
+                                settings.season_id,
+                                entry,
+                                event,
+                                pick["element"],
+                                pick["position"],
+                                pick["multiplier"],
+                                pick.get("is_captain", False),
+                                pick.get("is_vice_captain", False),
+                                json_dumps(pick),
+                            )
+
+    async def map_limited(
+        self, items: Iterable[int], func: Callable[[int], Awaitable[None]], label: str
+    ) -> int:
+        values = list(items)
+        done = 0
+
+        async def wrapped(item: int) -> None:
+            nonlocal done
+            try:
+                await func(item)
+            except Exception as exc:  # continue cohort collection and report each failure
+                print(f"{label} item={item} error={exc!r}", flush=True)
+            done += 1
+            if done % 100 == 0 or done == len(values):
+                print(f"{label} {done}/{len(values)}", flush=True)
+
+        await asyncio.gather(*(wrapped(item) for item in values))
+        return done
+
+    async def sync_cohort(self, limit: int, include_picks: bool) -> dict[str, Any]:
+        event = await self.current_event()
+        entries = await self.cohort_entries(limit)
+
+        async def one(entry: int) -> None:
+            await self.sync_manager(entry, event, include_picks)
+
+        done = await self.map_limited(entries, one, "deep cohort")
+        return {"event": event, "requested": limit, "collected": done, "picks": include_picks}
+
+    async def quality_checks(self, run_id: int, event: int | None) -> list[dict[str, str]]:
+        checks = [
+            ("one_active_season", "SELECT count(*) FROM seasons WHERE is_active", 1, "fail"),
+            ("event_count", "SELECT count(*) FROM fpl_events WHERE season_id=$1", 38, "fail"),
+            ("team_count", "SELECT count(*) FROM fpl_teams WHERE season_id=$1", 20, "fail"),
+            ("player_minimum", "SELECT count(*) FROM fpl_players WHERE season_id=$1", 400, "fail_min"),
+            ("standings_present", "SELECT count(*) FROM vw_latest_standings WHERE season_id=$1", 1, "warn_min"),
+        ]
+        results: list[dict[str, str]] = []
+        for name, sql, expected, mode in checks:
+            observed = await self.db.fetchval(sql, settings.season_id) if "$1" in sql else await self.db.fetchval(sql)
+            if mode == "fail":
+                status = "pass" if observed == expected else "fail"
+            elif mode == "fail_min":
+                status = "pass" if observed >= expected else "fail"
+            else:
+                status = "pass" if observed >= expected else "warn"
+            await self.db.execute(
+                """
+                INSERT INTO data_quality_results
+                    (pipeline_run_id,season_id,event,check_name,status,observed_value,expected_value)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                """,
+                run_id,
+                settings.season_id,
+                event,
+                name,
+                status,
+                str(observed),
+                str(expected),
+            )
+            results.append({"check": name, "status": status, "observed": str(observed)})
+        return results
+
+
+async def run(args: argparse.Namespace) -> None:
+    db = await asyncpg.create_pool(
+        os.environ["DATABASE_URL"], min_size=1, max_size=max(4, args.concurrency + 2)
+    )
+    pipeline = SeasonPipeline(db, args.concurrency, args.pause)
+    run_id = await db.fetchval(
+        "INSERT INTO pipeline_runs (season_id,job_name) VALUES ($1,$2) RETURNING id",
+        settings.season_id,
+        args.job,
+    )
+    stats: dict[str, Any] = {}
+    try:
+        if args.job == "bootstrap":
+            stats["bootstrap"] = await pipeline.sync_bootstrap()
+        elif args.job == "standings":
+            stats["standings"] = await pipeline.sync_standings(args.max_pages or None)
+        elif args.job == "live":
+            event = args.event or await pipeline.current_event()
+            if not event:
+                raise RuntimeError("No current event; run bootstrap first or pass --event")
+            stats["live"] = await pipeline.sync_event_live(event)
+        elif args.job == "cohort":
+            stats["cohort"] = await pipeline.sync_cohort(args.cohort_size, args.include_picks)
+        elif args.job == "weekly":
+            stats["bootstrap"] = await pipeline.sync_bootstrap()
+            stats["standings"] = await pipeline.sync_standings(args.max_pages or None)
+            event = stats["bootstrap"].get("current_event")
+            if event:
+                stats["live"] = await pipeline.sync_event_live(event)
+            stats["cohort"] = await pipeline.sync_cohort(args.cohort_size, args.include_picks)
+        else:
+            raise ValueError(f"Unknown job {args.job}")
+
+        event = await pipeline.current_event()
+        stats["quality"] = await pipeline.quality_checks(run_id, event)
+        if any(row["status"] == "fail" for row in stats["quality"]):
+            raise RuntimeError("One or more required data-quality checks failed")
+        await db.execute(
+            """
+            UPDATE pipeline_runs SET status='finished',finished_at=now(),stats=$2::jsonb
+            WHERE id=$1
+            """,
+            run_id,
+            json_dumps(stats),
+        )
+        print(json.dumps(stats, indent=2, default=str))
+    except Exception as exc:
+        await db.execute(
+            """
+            UPDATE pipeline_runs SET status='failed',finished_at=now(),stats=$2::jsonb,error=$3
+            WHERE id=$1
+            """,
+            run_id,
+            json_dumps(stats),
+            repr(exc),
+        )
+        raise
+    finally:
+        await pipeline.close()
+        await db.close()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect season-aware FPL Kenya data")
+    parser.add_argument("job", choices=["bootstrap", "standings", "live", "cohort", "weekly"])
+    parser.add_argument("--concurrency", type=int, default=settings.request_concurrency)
+    parser.add_argument("--pause", type=float, default=settings.request_pause_seconds)
+    parser.add_argument("--max-pages", type=int, default=200, help="0 means all standings pages")
+    parser.add_argument("--cohort-size", type=int, default=settings.deep_cohort_size)
+    parser.add_argument("--include-picks", action="store_true")
+    parser.add_argument("--event", type=int)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    if "DATABASE_URL" not in os.environ:
+        print("DATABASE_URL is required", file=sys.stderr)
+        raise SystemExit(2)
+    asyncio.run(run(parse_args()))

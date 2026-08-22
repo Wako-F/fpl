@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh FPL Kenya static data every four hours
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=4h
+Persistent=true
+RandomizedDelaySec=2m
+
+[Install]
+WantedBy=timers.target

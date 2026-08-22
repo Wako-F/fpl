@@ -1,0 +1,8 @@
+import type { Metadata } from "next";
+import { SiteFooter, SiteHeader } from "@/components/shell";
+
+export const metadata: Metadata = { title: "Privacy and data use" };
+
+export default function PrivacyPage() {
+  return <><SiteHeader /><main id="main-content" className="mx-auto max-w-4xl px-5 py-12 md:px-8 md:py-20"><div className="font-mono text-xs uppercase tracking-[0.22em] text-[#1f6b4d]">Privacy · data use</div><h1 className="mt-5 text-5xl font-semibold tracking-[-0.05em] md:text-7xl">Public data, used with restraint.</h1><div className="mt-10 grid gap-8 text-base leading-8 text-stone-600"><section><h2 className="text-xl font-semibold text-stone-950">What we display</h2><p className="mt-2">The public manager and team names, scores, and ranks returned by Fantasy Premier League for the Kenya country league. Behavioural analysis uses a declared cohort and publishes sample sizes.</p></section><section><h2 className="text-xl font-semibold text-stone-950">What we do not collect</h2><p className="mt-2">We do not request account passwords, email addresses, phone numbers, payment information, or private league credentials. Public aggregate downloads omit manager names.</p></section><section><h2 className="text-xl font-semibold text-stone-950">Corrections and removal</h2><p className="mt-2">A contact and removal workflow should be configured before public promotion. Until then, do not submit sensitive personal information through the site.</p></section><section><h2 className="text-xl font-semibold text-stone-950">Independence</h2><p className="mt-2">FPL Kenya is an independent analysis project and is not affiliated with or endorsed by the Premier League.</p></section></div></main><SiteFooter /></>;
+}

@@ -1,4 +1,151 @@
 const API_BASE = process.env.FPLKE_API_BASE ?? "http://127.0.0.1:8010";
+export const DATA_REVALIDATE_SECONDS = 86_400;
+export const LIVE_REVALIDATE_SECONDS = 120;
+
+export type LiveOverview = {
+  season: {
+    id: string;
+    label: string;
+    is_active: boolean;
+  };
+  event: null | {
+    event: number;
+    name: string;
+    deadline_time: string;
+    finished: boolean;
+    data_checked: boolean;
+    average_entry_score: number | null;
+    highest_score: number | null;
+  };
+  snapshot: null | {
+    id: number;
+    captured_at: string;
+    is_complete: boolean;
+    pages_collected: number;
+    managers_collected: number;
+  };
+  summary: null | {
+    managers: number;
+    min_points: number;
+    max_points: number;
+    avg_points: string;
+    median_points: string;
+    p90_points: string;
+    p99_points: string;
+  };
+  cohort: {
+    managers: number;
+    avg_points: string | null;
+    median_points: string | null;
+    max_points: number | null;
+    avg_bench_points: string | null;
+    avg_transfer_cost: string | null;
+  };
+  leaders: LeaderboardRow[];
+  topPlayers: LivePlayer[];
+  fixtures: Fixture[];
+};
+
+export type LivePlayer = {
+  element: number;
+  web_name: string;
+  short_name: string;
+  total_points: number;
+  minutes: number;
+  goals_scored: number;
+  assists: number;
+  bonus: number;
+  bps: number;
+  defensive_contribution: number;
+};
+
+export type Fixture = {
+  fixture_id: number;
+  event: number;
+  kickoff_time: string;
+  finished: boolean;
+  started: boolean;
+  team_h_name: string;
+  team_h_short: string;
+  team_h_score: number | null;
+  team_a_name: string;
+  team_a_short: string;
+  team_a_score: number | null;
+};
+
+export type LeaderboardSnapshot = {
+  snapshot: LiveOverview["snapshot"];
+  rows: LeaderboardRow[];
+};
+
+export type PlayerExplorer = {
+  season: string;
+  event: number;
+  sort: string;
+  rows: Array<{
+    element: number;
+    web_name: string;
+    first_name: string;
+    second_name: string;
+    team_name: string;
+    short_name: string;
+    element_type: number;
+    now_cost: number;
+    status: string;
+    selected_by_percent: string;
+    total_points: number;
+    event_points: number;
+    form: string;
+    live_points: number | null;
+    minutes: number | null;
+    bonus: number | null;
+    bps: number | null;
+    live_defensive_contribution: number | null;
+    defensive_contribution: number | null;
+    transfers_in_event: number;
+    transfers_out_event: number;
+    price_change_projection: unknown;
+  }>;
+};
+
+export type WeeklyContent = {
+  season: string;
+  event: number;
+  facts: Record<
+    string,
+    {
+      status: "live" | "provisional" | "final";
+      value: Record<string, unknown> | Array<Record<string, unknown>> | null;
+      cohort: string;
+      sample_size: number;
+      calculated_at: string;
+      methodology: string;
+      source_snapshot_id: number;
+    }
+  >;
+};
+
+export type LiveManagerDetail = {
+  season: string;
+  manager: LeaderboardRow & {
+    player_region_name: string | null;
+    summary_overall_rank: number | null;
+    summary_overall_points: number | null;
+    favourite_team: number | null;
+  };
+  metrics: null | {
+    gameweeks: number;
+    avg_points: string;
+    volatility: string | null;
+    best_week: number;
+    worst_week: number;
+    bench_points: number;
+    transfer_cost: number;
+    avg_team_value: string;
+  };
+  history: ManagerDetail["history"];
+  chips: Array<{ chip_name: string; event: number }>;
+};
 
 export type Overview = {
   summary: {
@@ -53,6 +200,7 @@ export type LeaderboardRow = {
   last_rank: number;
   total: number;
   event_total: number;
+  rank_gain?: number;
 };
 
 export type ManagerDetail = {
@@ -236,12 +384,44 @@ export type Insights = {
 
 async function getJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
-    cache: "no-store",
+    next: { revalidate: DATA_REVALIDATE_SECONDS },
   });
   if (!response.ok) {
     throw new Error(`API request failed: ${response.status} ${path}`);
   }
   return response.json() as Promise<T>;
+}
+
+async function getLiveJson<T>(path: string): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
+    next: { revalidate: LIVE_REVALIDATE_SECONDS },
+  });
+  if (!response.ok) {
+    throw new Error(`Live API request failed: ${response.status} ${path}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+export function getLiveOverview() {
+  return getLiveJson<LiveOverview>("/v2/overview");
+}
+
+export function getLiveLeaderboard(limit = 100, q = "") {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (q) params.set("q", q);
+  return getLiveJson<LeaderboardSnapshot>(`/v2/leaderboard?${params}`);
+}
+
+export function getLivePlayers(sort = "points", limit = 100) {
+  return getLiveJson<PlayerExplorer>(`/v2/players?sort=${encodeURIComponent(sort)}&limit=${limit}`);
+}
+
+export function getLiveManager(entry: string) {
+  return getLiveJson<LiveManagerDetail>(`/v2/managers/${entry}`);
+}
+
+export function getWeeklyContent(event: number) {
+  return getLiveJson<WeeklyContent>(`/v2/gameweeks/${event}/content`);
 }
 
 export function getOverview() {

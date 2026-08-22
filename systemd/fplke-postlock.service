@@ -1,0 +1,10 @@
+[Unit]
+Description=FPL Kenya post-lock cohort and editorial pack
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=codex
+Group=codex
+WorkingDirectory=/opt/fplke
+ExecStart=/opt/fplke/scripts/run_postlock.sh

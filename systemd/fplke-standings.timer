@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the bounded Kenya standings snapshot
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=2h
+Persistent=true
+RandomizedDelaySec=3m
+
+[Install]
+WantedBy=timers.target

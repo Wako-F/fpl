@@ -1,0 +1,10 @@
+[Unit]
+Description=Generate the FPL Kenya post-lock report each day
+
+[Timer]
+OnCalendar=*-*-* 12:15:00 Africa/Nairobi
+Persistent=true
+RandomizedDelaySec=2m
+
+[Install]
+WantedBy=timers.target
