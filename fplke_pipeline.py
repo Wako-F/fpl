@@ -32,6 +32,10 @@ def json_dumps(value: Any) -> str:
 def decimal_or_none(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def datetime_or_none(value: Any) -> datetime | None:
@@ -42,10 +46,6 @@ def datetime_or_none(value: Any) -> datetime | None:
     if isinstance(value, str):
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     raise TypeError(f"Expected ISO timestamp, got {type(value).__name__}")
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return None
 
 
 @dataclass
