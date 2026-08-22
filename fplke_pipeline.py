@@ -398,6 +398,9 @@ class SeasonPipeline:
 
         is_complete = not has_next
         pages_collected = page - 1
+        unique_managers = await self.db.fetchval(
+            "SELECT count(*) FROM standings_snapshot_rows WHERE snapshot_id=$1", snapshot_id
+        )
         await self.db.execute(
             """
             UPDATE standings_snapshots
@@ -407,13 +410,14 @@ class SeasonPipeline:
             snapshot_id,
             is_complete,
             pages_collected,
-            rows_collected,
+            unique_managers,
         )
         return {
             "snapshot_id": snapshot_id,
             "event": event,
             "pages": pages_collected,
-            "managers": rows_collected,
+            "managers": unique_managers,
+            "rows_fetched": rows_collected,
             "is_complete": is_complete,
         }
 
