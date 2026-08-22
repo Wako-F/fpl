@@ -1,4 +1,5 @@
-const API_BASE = process.env.FPLKE_API_BASE ?? "http://127.0.0.1:8010";
+const API_BASE =
+  process.env.FPLKE_API_BASE ?? "http://38.242.228.254/fplke-data";
 export const DATA_REVALIDATE_SECONDS = 86_400;
 export const LIVE_REVALIDATE_SECONDS = 120;
 
