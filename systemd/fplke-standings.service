@@ -1,5 +1,5 @@
 [Unit]
-Description=FPL Kenya bounded standings snapshot
+Description=FPL Kenya fast live standings snapshot
 After=network-online.target postgresql.service
 
 [Service]

@@ -56,7 +56,8 @@ async def build_pack(conn: asyncpg.Connection, event: int | None = None) -> dict
         """
         SELECT * FROM standings_snapshots
         WHERE season_id=$1 AND (event=$2 OR event IS NULL)
-        ORDER BY captured_at DESC LIMIT 1
+          AND COALESCE(crawl_status, 'finished')='finished'
+        ORDER BY is_complete DESC,captured_at DESC LIMIT 1
         """,
         settings.season_id,
         event,
@@ -160,8 +161,9 @@ async def build_pack(conn: asyncpg.Connection, event: int | None = None) -> dict
 
     previous_ids = await conn.fetch(
         """
-        SELECT id FROM standings_snapshots WHERE season_id=$1
-        ORDER BY captured_at DESC LIMIT 2
+        SELECT id FROM standings_snapshots
+        WHERE season_id=$1 AND COALESCE(crawl_status, 'finished')='finished'
+        ORDER BY event DESC NULLS LAST,is_complete DESC,captured_at DESC LIMIT 2
         """,
         settings.season_id,
     )

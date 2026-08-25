@@ -1,0 +1,10 @@
+[Unit]
+Description=Attempt the complete Kenya standings crawl each morning
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 Africa/Nairobi
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

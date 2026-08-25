@@ -38,6 +38,8 @@ class ApiContractTest(unittest.TestCase):
             "/v2/managers/{entry}",
             "/v2/gameweeks/{event}/content",
             "/v2/gameweeks/{event}/fixtures",
+            "/v2/ops",
+            "/v2/content-packs/{event}/{artifact}",
         }
         self.assertTrue(required.issubset(paths))
 

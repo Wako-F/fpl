@@ -1,0 +1,15 @@
+[Unit]
+Description=FPL Kenya complete country standings crawl
+After=network-online.target postgresql.service
+
+[Service]
+Type=oneshot
+User=codex
+Group=codex
+WorkingDirectory=/opt/fplke
+EnvironmentFile=/opt/fplke/.env
+ExecStart=/opt/fplke/.venv/bin/python /opt/fplke/fplke_pipeline.py standings --max-pages 0 --resume --require-data-checked --if-needed
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+TimeoutStartSec=3h

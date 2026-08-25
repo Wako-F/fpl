@@ -74,6 +74,7 @@ export function SiteFooter() {
           <Link href="/methodology" className="hover:text-stone-950">Methodology</Link>
           <Link href="/archive/2025-26" className="hover:text-stone-950">2025/26 archive</Link>
           <Link href="/privacy" className="hover:text-stone-950">Privacy</Link>
+          <Link href="/ops" className="hover:text-stone-950">Control room</Link>
         </nav>
       </div>
     </footer>

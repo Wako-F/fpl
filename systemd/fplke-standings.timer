@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh the bounded Kenya standings snapshot
+Description=Refresh the fast live Kenya standings snapshot
 
 [Timer]
 OnBootSec=10m

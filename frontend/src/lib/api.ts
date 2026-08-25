@@ -126,6 +126,106 @@ export type WeeklyContent = {
   >;
 };
 
+export type OpsStatus = {
+  season: string;
+  event: null | {
+    event: number;
+    name: string;
+    deadline_time: string;
+    finished: boolean;
+    data_checked: boolean;
+    average_entry_score: number | null;
+    highest_score: number | null;
+    ranked_count: number | null;
+    updated_at: string;
+  };
+  published_snapshot: null | {
+    id: number;
+    event: number;
+    captured_at: string;
+    is_complete: boolean;
+    pages_collected: number;
+    managers_collected: number;
+    crawl_mode: "bounded" | "full";
+    crawl_status: "running" | "finished" | "failed";
+    expected_pages: number | null;
+    expected_rows: number | null;
+    rows_fetched: number;
+    duplicate_rows: number;
+  };
+  full_crawl: null | {
+    id: number;
+    event: number;
+    crawl_mode: "full";
+    crawl_status: "running" | "finished" | "failed";
+    started_at: string;
+    finished_at: string | null;
+    last_heartbeat_at: string | null;
+    expected_pages: number | null;
+    expected_rows: number | null;
+    pages_collected: number;
+    managers_collected: number;
+    rows_fetched: number;
+    duplicate_rows: number;
+    is_complete: boolean;
+    progress: null | {
+      scheduled_pages: number;
+      finished_pages: number;
+      running_pages: number;
+      failed_pages: number;
+      rows_fetched: number;
+      avg_page_ms: number | null;
+      latest_page_at: string | null;
+    };
+  };
+  freshness: {
+    live_players: string | null;
+    bootstrap: string | null;
+    fixtures: string | null;
+    standings: string | null;
+  };
+  quality: Array<{
+    check_name: string;
+    status: "pass" | "warn" | "fail";
+    observed_value: string | null;
+    expected_value: string | null;
+    checked_at: string;
+  }>;
+  runs: Array<{
+    id: number;
+    job_name: string;
+    status: "running" | "finished" | "failed";
+    started_at: string;
+    finished_at: string | null;
+    duration_seconds: number;
+    has_error: boolean;
+  }>;
+  content_packs: Array<{
+    event: number;
+    calculated_at: string;
+    facts: number;
+    status: "live" | "provisional" | "final";
+    source_snapshot_id: number;
+    largest_sample: number;
+    artifacts: Array<{
+      key: "article" | "social" | "engineering" | "brief";
+      filename: string;
+      bytes: number;
+      modified_at: string;
+    }>;
+  }>;
+};
+
+export type ContentArtifact = {
+  season: string;
+  event: number;
+  artifact: "article" | "social" | "engineering" | "brief";
+  filename: string;
+  bytes: number;
+  modified_at: string;
+  content: string;
+};
+
 export type LiveManagerDetail = {
   season: string;
   manager: LeaderboardRow & {
@@ -423,6 +523,16 @@ export function getLiveManager(entry: string) {
 
 export function getWeeklyContent(event: number) {
   return getLiveJson<WeeklyContent>(`/v2/gameweeks/${event}/content`);
+}
+
+export function getOpsStatus() {
+  return getLiveJson<OpsStatus>("/v2/ops");
+}
+
+export function getContentArtifact(event: number, artifact: string) {
+  return getLiveJson<ContentArtifact>(
+    `/v2/content-packs/${event}/${encodeURIComponent(artifact)}`,
+  );
 }
 
 export function getOverview() {

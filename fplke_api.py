@@ -1,15 +1,19 @@
 import json
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+CONTENT_ROOT = Path(os.environ.get("FPLKE_CONTENT_DIR", "content/generated"))
 
 db_pool: asyncpg.Pool | None = None
 redis_client: Redis | None = None
@@ -909,3 +913,170 @@ async def fixtures_v2(event: int, season: str | None = None):
             event,
         )
         return [dict(row) for row in rows]
+
+
+def artifact_inventory(season_id: str, event: int) -> list[dict[str, object]]:
+    directory = CONTENT_ROOT / season_id / f"gw-{event:02d}"
+    artifacts = {
+        "article": "article.md",
+        "social": "social.md",
+        "engineering": "engineering.md",
+        "brief": "brief.json",
+    }
+    inventory: list[dict[str, object]] = []
+    for key, filename in artifacts.items():
+        path = directory / filename
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        inventory.append(
+            {
+                "key": key,
+                "filename": filename,
+                "bytes": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc),
+            }
+        )
+    return inventory
+
+
+@app.get("/v2/ops")
+async def ops_v2(season: str | None = None):
+    """Publication-safe operational state for the VPS project cockpit."""
+    season_id = await resolve_season(season)
+    async with pool().acquire() as conn:
+        event = await conn.fetchrow(
+            """
+            SELECT event,name,deadline_time,finished,data_checked,average_entry_score,
+                   highest_score,ranked_count,updated_at
+            FROM fpl_events WHERE season_id=$1
+            ORDER BY is_current DESC,is_previous DESC,event DESC LIMIT 1
+            """,
+            season_id,
+        )
+        published = await conn.fetchrow(
+            "SELECT * FROM vw_latest_standings_snapshot WHERE season_id=$1", season_id
+        )
+        crawl = await conn.fetchrow(
+            """
+            SELECT id,event,captured_at,crawl_mode,crawl_status,started_at,finished_at,
+                   last_heartbeat_at,expected_pages,expected_rows,pages_collected,
+                   managers_collected,rows_fetched,duplicate_rows,is_complete
+            FROM standings_snapshots
+            WHERE season_id=$1 AND crawl_mode='full'
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            season_id,
+        )
+        crawl_progress = None
+        if crawl:
+            crawl_progress = await conn.fetchrow(
+                """
+                SELECT count(*)::integer AS scheduled_pages,
+                       count(*) FILTER (WHERE status='finished')::integer AS finished_pages,
+                       count(*) FILTER (WHERE status='running')::integer AS running_pages,
+                       count(*) FILTER (WHERE status='failed')::integer AS failed_pages,
+                       COALESCE(sum(row_count) FILTER (WHERE status='finished'),0)::integer AS rows_fetched,
+                       round(avg(duration_ms) FILTER (WHERE status='finished'))::integer AS avg_page_ms,
+                       max(fetched_at) AS latest_page_at
+                FROM standings_crawl_pages WHERE snapshot_id=$1
+                """,
+                crawl["id"],
+            )
+        runs = await conn.fetch(
+            """
+            SELECT id,job_name,status,started_at,finished_at,
+                   round(extract(epoch FROM (COALESCE(finished_at,now())-started_at)))::integer
+                       AS duration_seconds,
+                   (error IS NOT NULL) AS has_error
+            FROM pipeline_runs WHERE season_id=$1
+            ORDER BY started_at DESC LIMIT 16
+            """,
+            season_id,
+        )
+        freshness = await conn.fetchrow(
+            """
+            SELECT
+                (SELECT max(updated_at) FROM player_event_live_v2 WHERE season_id=$1) AS live_players,
+                (SELECT max(updated_at) FROM fpl_players WHERE season_id=$1) AS bootstrap,
+                (SELECT max(updated_at) FROM fpl_fixtures WHERE season_id=$1) AS fixtures,
+                (SELECT max(captured_at) FROM standings_snapshots
+                    WHERE season_id=$1 AND crawl_status='finished') AS standings
+            """,
+            season_id,
+        )
+        quality = await conn.fetch(
+            """
+            SELECT DISTINCT ON (check_name) check_name,status,observed_value,
+                   expected_value,checked_at
+            FROM data_quality_results WHERE season_id=$1
+            ORDER BY check_name,checked_at DESC
+            """,
+            season_id,
+        )
+        pack_rows = await conn.fetch(
+            """
+            SELECT event,max(calculated_at) AS calculated_at,
+                   count(DISTINCT fact_key)::integer AS facts,
+                   (array_agg(status ORDER BY calculated_at DESC))[1] AS status,
+                   max(source_snapshot_id) AS source_snapshot_id,
+                   max(sample_size)::integer AS largest_sample
+            FROM content_facts WHERE season_id=$1
+            GROUP BY event ORDER BY event DESC
+            """,
+            season_id,
+        )
+        packs = []
+        for row in pack_rows:
+            item = dict(row)
+            item["artifacts"] = artifact_inventory(season_id, row["event"])
+            packs.append(item)
+        return {
+            "season": season_id,
+            "event": dict(event) if event else None,
+            "published_snapshot": dict(published) if published else None,
+            "full_crawl": {
+                **(dict(crawl) if crawl else {}),
+                "progress": dict(crawl_progress) if crawl_progress else None,
+            }
+            if crawl
+            else None,
+            "freshness": dict(freshness),
+            "quality": [dict(row) for row in quality],
+            "runs": [dict(row) for row in runs],
+            "content_packs": packs,
+        }
+
+
+@app.get("/v2/content-packs/{event}/{artifact}")
+async def content_pack_artifact_v2(
+    event: int,
+    artifact: str,
+    season: str | None = None,
+):
+    season_id = await resolve_season(season)
+    filenames = {
+        "article": "article.md",
+        "social": "social.md",
+        "engineering": "engineering.md",
+        "brief": "brief.json",
+    }
+    filename = filenames.get(artifact)
+    if filename is None or not 1 <= event <= 38:
+        raise HTTPException(status_code=404, detail="Content artifact not found")
+    path = CONTENT_ROOT / season_id / f"gw-{event:02d}" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Content artifact not found")
+    stat = path.stat()
+    return JSONResponse(
+        {
+            "season": season_id,
+            "event": event,
+            "artifact": artifact,
+            "filename": filename,
+            "bytes": stat.st_size,
+            "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            "content": path.read_text(encoding="utf-8"),
+        },
+        headers={"Cache-Control": "no-store"},
+    )

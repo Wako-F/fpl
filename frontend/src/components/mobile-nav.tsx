@@ -12,6 +12,7 @@ export const navigationItems = [
   { href: "/stories", label: "Weekly report" },
   { href: "/lab", label: "Data lab" },
   { href: "/methodology", label: "Methodology" },
+  { href: "/ops", label: "Control room" },
 ];
 
 function isActive(pathname: string, href: string) {

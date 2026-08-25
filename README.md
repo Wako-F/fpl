@@ -23,6 +23,7 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -f migrations/001_season_platform.sql
+psql "$DATABASE_URL" -f migrations/002_full_country_crawls.sql
 python fplke_pipeline.py bootstrap
 python fplke_pipeline.py standings --max-pages 20
 python fplke_pipeline.py live
@@ -44,7 +45,10 @@ npm run dev
 
 ## Data scope
 
-The pipeline defaults to a bounded standings crawl and a 1,000-manager deep cohort. `--max-pages 0` requests every available standings page and must be used only after reviewing operational and data-use constraints.
+The live pipeline uses a bounded standings crawl and a 1,000-manager deep cohort. A checkpointed
+full-country crawl runs once per completed gameweek so the published national table can include
+every Kenyan manager. See [`FULL_COUNTRY_STRATEGY.md`](FULL_COUNTRY_STRATEGY.md) for the workload
+split, completeness contract, and operating tactics.
 
 - National scores and ranks: latest captured Kenya country-league snapshot.
 - Captaincy, chips, picks, transfers, and bench behaviour: declared deep cohort.
@@ -68,6 +72,12 @@ scripts/run_postlock.sh
 ```
 
 This refreshes static data and standings, updates the manager cohort and picks, and writes the article, social, engineering, and machine-readable briefs under `content/generated/`.
+
+## Production control room
+
+The read-only VPS cockpit is served at `/fplke/ops`. It shows complete-crawl progress, published
+coverage, data freshness, quality checks, recent pipeline runs, and previews of the generated
+article, social, engineering, and JSON artifacts. It does not expose credentials or raw logs.
 
 ## Verification
 

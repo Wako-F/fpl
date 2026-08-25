@@ -14,6 +14,7 @@ import json
 import os
 import random
 import sys
+import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
@@ -58,6 +59,7 @@ class FetchResult:
 class SeasonPipeline:
     def __init__(self, db: asyncpg.Pool, concurrency: int, pause: float):
         self.db = db
+        self.concurrency = concurrency
         self.sem = asyncio.Semaphore(concurrency)
         self.pause = pause
         self.client = httpx.AsyncClient(
@@ -339,12 +341,409 @@ class SeasonPipeline:
                     )
         return {"event": event, "players": len(result.payload.get("elements", []))}
 
-    async def sync_standings(self, max_pages: int | None) -> dict[str, Any]:
+    async def _standings_page(self, page: int) -> FetchResult:
+        return await self.fetch(
+            f"/leagues-classic/{settings.league_id}/standings/?page_standings={page}"
+        )
+
+    async def _discover_last_standings_page(self) -> tuple[int, dict[int, FetchResult]]:
+        """Find the terminal page in O(log n) requests and retain probe responses."""
+        probes: dict[int, FetchResult] = {}
+
+        async def probe(page: int) -> tuple[int, bool]:
+            if page not in probes:
+                result = await self._standings_page(page)
+                if result.status_code != 200:
+                    raise RuntimeError(
+                        f"Standings boundary probe {page} returned {result.status_code}"
+                    )
+                probes[page] = result
+            standings = probes[page].payload.get("standings", {})
+            return len(standings.get("results", [])), bool(standings.get("has_next"))
+
+        rows, has_next = await probe(1)
+        if not rows:
+            raise RuntimeError("The Kenya standings league returned no managers")
+        if not has_next:
+            return 1, probes
+
+        low = 1
+        high = 2
+        while True:
+            _, high_has_next = await probe(high)
+            if not high_has_next:
+                break
+            low = high
+            high *= 2
+
+        while high - low > 1:
+            middle = (low + high) // 2
+            _, middle_has_next = await probe(middle)
+            if middle_has_next:
+                low = middle
+            else:
+                high = middle
+
+        terminal_rows, terminal_has_next = await probe(high)
+        if not terminal_rows or terminal_has_next:
+            raise RuntimeError(f"Unable to verify terminal standings page {high}")
+        return high, probes
+
+    async def _write_standings_page(
+        self,
+        snapshot_id: int,
+        event: int | None,
+        page: int,
+        result: FetchResult,
+        duration_ms: int,
+    ) -> int:
+        await self.store_raw(result, "kenya_standings", page, event=event, page=page)
+        if result.status_code != 200:
+            raise RuntimeError(f"Standings page {page} returned {result.status_code}")
+        standings = result.payload.get("standings", {})
+        rows = standings.get("results", [])
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1 AND page=$2",
+                    snapshot_id,
+                    page,
+                )
+                await conn.executemany(
+                    """
+                    INSERT INTO standings_snapshot_rows
+                        (snapshot_id,season_id,event,page,entry,entry_name,player_name,rank,
+                         last_rank,total,event_total,has_played,raw)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+                    ON CONFLICT (snapshot_id,entry) DO UPDATE SET
+                        page=EXCLUDED.page,entry_name=EXCLUDED.entry_name,
+                        player_name=EXCLUDED.player_name,rank=EXCLUDED.rank,
+                        last_rank=EXCLUDED.last_rank,total=EXCLUDED.total,
+                        event_total=EXCLUDED.event_total,has_played=EXCLUDED.has_played,
+                        raw=EXCLUDED.raw
+                    """,
+                    [
+                        (
+                            snapshot_id,
+                            settings.season_id,
+                            event,
+                            page,
+                            row["entry"],
+                            row.get("entry_name"),
+                            row.get("player_name"),
+                            row.get("rank"),
+                            row.get("last_rank"),
+                            row.get("total"),
+                            row.get("event_total"),
+                            row.get("has_played"),
+                            json_dumps(row),
+                        )
+                        for row in rows
+                    ],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO standings_crawl_pages
+                        (snapshot_id,page,status,attempts,row_count,has_next,started_at,
+                         fetched_at,duration_ms,error_summary)
+                    VALUES ($1,$2,'finished',1,$3,$4,now(),now(),$5,NULL)
+                    ON CONFLICT (snapshot_id,page) DO UPDATE SET
+                        status='finished',attempts=standings_crawl_pages.attempts+1,
+                        row_count=EXCLUDED.row_count,has_next=EXCLUDED.has_next,
+                        fetched_at=now(),duration_ms=EXCLUDED.duration_ms,error_summary=NULL
+                    """,
+                    snapshot_id,
+                    page,
+                    len(rows),
+                    bool(standings.get("has_next")),
+                    duration_ms,
+                )
+        return len(rows)
+
+    async def sync_full_standings(
+        self,
+        *,
+        resume: bool,
+        require_data_checked: bool,
+        if_needed: bool,
+    ) -> dict[str, Any]:
+        event = await self.current_event()
+        if event is None:
+            raise RuntimeError("No current event; run bootstrap first")
+        data_checked = bool(
+            await self.db.fetchval(
+                "SELECT data_checked FROM fpl_events WHERE season_id=$1 AND event=$2",
+                settings.season_id,
+                event,
+            )
+        )
+        if require_data_checked and not data_checked:
+            return {
+                "event": event,
+                "skipped": True,
+                "reason": "official FPL data is not checked yet",
+            }
+        if if_needed:
+            existing = await self.db.fetchrow(
+                """
+                SELECT id,managers_collected,pages_collected FROM standings_snapshots
+                WHERE season_id=$1 AND event=$2 AND crawl_mode='full'
+                  AND crawl_status='finished' AND is_complete
+                ORDER BY captured_at DESC LIMIT 1
+                """,
+                settings.season_id,
+                event,
+            )
+            if existing:
+                return {
+                    "event": event,
+                    "snapshot_id": existing["id"],
+                    "pages": existing["pages_collected"],
+                    "managers": existing["managers_collected"],
+                    "is_complete": True,
+                    "skipped": True,
+                    "reason": "a complete full-country snapshot already exists",
+                }
+
+        last_page, probes = await self._discover_last_standings_page()
+        terminal_rows = len(probes[last_page].payload.get("standings", {}).get("results", []))
+        expected_rows = (last_page - 1) * 50 + terminal_rows
+
+        snapshot = None
+        if resume:
+            snapshot = await self.db.fetchrow(
+                """
+                SELECT id,duplicate_rows FROM standings_snapshots
+                WHERE season_id=$1 AND event=$2 AND crawl_mode='full'
+                  AND crawl_status IN ('running','failed')
+                  AND started_at > now() - interval '12 hours'
+                ORDER BY started_at DESC LIMIT 1
+                """,
+                settings.season_id,
+                event,
+            )
+        if snapshot:
+            snapshot_id = snapshot["id"]
+            if snapshot["duplicate_rows"]:
+                async with self.db.acquire() as conn:
+                    async with conn.transaction():
+                        await conn.execute(
+                            "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1",
+                            snapshot_id,
+                        )
+                        await conn.execute(
+                            """
+                            UPDATE standings_crawl_pages SET status='pending',row_count=NULL,
+                                has_next=NULL,started_at=NULL,fetched_at=NULL,duration_ms=NULL,
+                                error_summary=NULL
+                            WHERE snapshot_id=$1
+                            """,
+                            snapshot_id,
+                        )
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1 AND page>$2",
+                        snapshot_id,
+                        last_page,
+                    )
+                    await conn.execute(
+                        "DELETE FROM standings_crawl_pages WHERE snapshot_id=$1 AND page>$2",
+                        snapshot_id,
+                        last_page,
+                    )
+            await self.db.execute(
+                """
+                UPDATE standings_snapshots SET crawl_status='running',error_summary=NULL,
+                    last_heartbeat_at=now(),expected_pages=$2,expected_rows=$3
+                WHERE id=$1
+                """,
+                snapshot_id,
+                last_page,
+                expected_rows,
+            )
+        else:
+            snapshot_id = await self.db.fetchval(
+                """
+                INSERT INTO standings_snapshots
+                    (season_id,event,source_note,crawl_mode,crawl_status,started_at,
+                     last_heartbeat_at,expected_pages,expected_rows)
+                VALUES ($1,$2,$3,'full','running',now(),now(),$4,$5) RETURNING id
+                """,
+                settings.season_id,
+                event,
+                "Official Kenya country league; resumable complete crawl",
+                last_page,
+                expected_rows,
+            )
+
+        await self.db.execute(
+            """
+            INSERT INTO standings_crawl_pages (snapshot_id,page,status)
+            SELECT $1,page,'pending' FROM generate_series(1,$2) AS page
+            ON CONFLICT (snapshot_id,page) DO NOTHING
+            """,
+            snapshot_id,
+            last_page,
+        )
+        completed_rows = await self.db.fetch(
+            "SELECT page FROM standings_crawl_pages WHERE snapshot_id=$1 AND status='finished'",
+            snapshot_id,
+        )
+        completed = {row["page"] for row in completed_rows}
+        pending = [page for page in range(1, last_page + 1) if page not in completed]
+        queue: asyncio.Queue[int | None] = asyncio.Queue()
+        for page in pending:
+            queue.put_nowait(page)
+        worker_count = max(1, min(self.concurrency, len(pending))) if pending else 0
+        for _ in range(worker_count):
+            queue.put_nowait(None)
+
+        errors: list[tuple[int, str]] = []
+        progress_lock = asyncio.Lock()
+        pages_done = len(completed)
+
+        async def worker() -> None:
+            nonlocal pages_done
+            while True:
+                page = await queue.get()
+                try:
+                    if page is None:
+                        return
+                    await self.db.execute(
+                        """
+                        UPDATE standings_crawl_pages
+                        SET status='running',started_at=now(),error_summary=NULL
+                        WHERE snapshot_id=$1 AND page=$2
+                        """,
+                        snapshot_id,
+                        page,
+                    )
+                    started = time.perf_counter()
+                    result = probes.get(page) or await self._standings_page(page)
+                    duration_ms = round((time.perf_counter() - started) * 1000)
+                    await self._write_standings_page(
+                        snapshot_id, event, page, result, duration_ms
+                    )
+                    async with progress_lock:
+                        pages_done += 1
+                        if pages_done % 50 == 0 or pages_done == last_page:
+                            await self.db.execute(
+                                """
+                                UPDATE standings_snapshots SET last_heartbeat_at=now()
+                                WHERE id=$1
+                                """,
+                                snapshot_id,
+                            )
+                            print(
+                                f"full standings {pages_done}/{last_page} pages "
+                                f"({pages_done / last_page:.1%})",
+                                flush=True,
+                            )
+                except Exception as exc:
+                    if page is not None:
+                        summary = f"{type(exc).__name__}: {exc}"[:500]
+                        errors.append((page, summary))
+                        await self.db.execute(
+                            """
+                            UPDATE standings_crawl_pages
+                            SET status='failed',attempts=attempts+1,fetched_at=now(),error_summary=$3
+                            WHERE snapshot_id=$1 AND page=$2
+                            """,
+                            snapshot_id,
+                            page,
+                            summary,
+                        )
+                finally:
+                    queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        if workers:
+            await queue.join()
+            await asyncio.gather(*workers)
+
+        page_stats = await self.db.fetchrow(
+            """
+            SELECT count(*) FILTER (WHERE status='finished')::integer AS pages,
+                   COALESCE(sum(row_count) FILTER (WHERE status='finished'),0)::integer AS rows_fetched,
+                   count(*) FILTER (WHERE status='failed')::integer AS failed_pages,
+                   bool_and(CASE WHEN page=$2 THEN has_next=false ELSE true END)
+                       FILTER (WHERE status='finished') AS terminal_verified
+            FROM standings_crawl_pages WHERE snapshot_id=$1
+            """,
+            snapshot_id,
+            last_page,
+        )
+        unique_managers = await self.db.fetchval(
+            "SELECT count(*) FROM standings_snapshot_rows WHERE snapshot_id=$1", snapshot_id
+        )
+        rows_fetched = page_stats["rows_fetched"]
+        duplicate_rows = max(0, rows_fetched - unique_managers)
+        is_complete = bool(
+            page_stats["pages"] == last_page
+            and page_stats["failed_pages"] == 0
+            and page_stats["terminal_verified"]
+            and rows_fetched == expected_rows
+            and duplicate_rows == 0
+        )
+        crawl_status = "finished" if is_complete else "failed"
+        error_summary = None
+        if not is_complete:
+            error_summary = (
+                f"coverage validation failed: pages={page_stats['pages']}/{last_page}, "
+                f"rows={rows_fetched}/{expected_rows}, duplicates={duplicate_rows}, "
+                f"failed_pages={page_stats['failed_pages']}"
+            )
+            if errors:
+                error_summary += f"; first_error={errors[0][0]} {errors[0][1]}"
+        await self.db.execute(
+            """
+            UPDATE standings_snapshots SET crawl_status=$2,is_complete=$3,
+                pages_collected=$4,managers_collected=$5,rows_fetched=$6,
+                duplicate_rows=$7,finished_at=now(),last_heartbeat_at=now(),error_summary=$8
+            WHERE id=$1
+            """,
+            snapshot_id,
+            crawl_status,
+            is_complete,
+            page_stats["pages"],
+            unique_managers,
+            rows_fetched,
+            duplicate_rows,
+            error_summary,
+        )
+        if not is_complete:
+            raise RuntimeError(error_summary)
+        return {
+            "snapshot_id": snapshot_id,
+            "event": event,
+            "pages": last_page,
+            "managers": unique_managers,
+            "rows_fetched": rows_fetched,
+            "is_complete": True,
+            "resumed_pages": len(completed),
+        }
+
+    async def sync_standings(
+        self,
+        max_pages: int | None,
+        *,
+        resume: bool = False,
+        require_data_checked: bool = False,
+        if_needed: bool = False,
+    ) -> dict[str, Any]:
+        if max_pages is None:
+            return await self.sync_full_standings(
+                resume=resume,
+                require_data_checked=require_data_checked,
+                if_needed=if_needed,
+            )
         event = await self.current_event()
         snapshot_id = await self.db.fetchval(
             """
-            INSERT INTO standings_snapshots (season_id,event,source_note)
-            VALUES ($1,$2,$3) RETURNING id
+            INSERT INTO standings_snapshots
+                (season_id,event,source_note,crawl_mode,crawl_status,started_at,last_heartbeat_at)
+            VALUES ($1,$2,$3,'bounded','running',now(),now()) RETURNING id
             """,
             settings.season_id,
             event,
@@ -404,13 +803,16 @@ class SeasonPipeline:
         await self.db.execute(
             """
             UPDATE standings_snapshots
-            SET is_complete=$2,pages_collected=$3,managers_collected=$4
+            SET is_complete=$2,pages_collected=$3,managers_collected=$4,
+                rows_fetched=$5,duplicate_rows=GREATEST(0,$5-$4),crawl_status='finished',
+                finished_at=now(),last_heartbeat_at=now()
             WHERE id=$1
             """,
             snapshot_id,
             is_complete,
             pages_collected,
             unique_managers,
+            rows_collected,
         )
         return {
             "snapshot_id": snapshot_id,
@@ -633,7 +1035,12 @@ async def run(args: argparse.Namespace) -> None:
         if args.job == "bootstrap":
             stats["bootstrap"] = await pipeline.sync_bootstrap()
         elif args.job == "standings":
-            stats["standings"] = await pipeline.sync_standings(args.max_pages or None)
+            stats["standings"] = await pipeline.sync_standings(
+                args.max_pages or None,
+                resume=args.resume,
+                require_data_checked=args.require_data_checked,
+                if_needed=args.if_needed,
+            )
         elif args.job == "live":
             event = args.event or await pipeline.current_event()
             if not event:
@@ -643,7 +1050,12 @@ async def run(args: argparse.Namespace) -> None:
             stats["cohort"] = await pipeline.sync_cohort(args.cohort_size, args.include_picks)
         elif args.job == "weekly":
             stats["bootstrap"] = await pipeline.sync_bootstrap()
-            stats["standings"] = await pipeline.sync_standings(args.max_pages or None)
+            stats["standings"] = await pipeline.sync_standings(
+                args.max_pages or None,
+                resume=args.resume,
+                require_data_checked=args.require_data_checked,
+                if_needed=args.if_needed,
+            )
             event = stats["bootstrap"].get("current_event")
             if event:
                 stats["live"] = await pipeline.sync_event_live(event)
@@ -686,6 +1098,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=settings.request_concurrency)
     parser.add_argument("--pause", type=float, default=settings.request_pause_seconds)
     parser.add_argument("--max-pages", type=int, default=200, help="0 means all standings pages")
+    parser.add_argument("--resume", action="store_true", help="resume a recent full crawl")
+    parser.add_argument(
+        "--require-data-checked",
+        action="store_true",
+        help="skip a full crawl until official FPL data is checked",
+    )
+    parser.add_argument(
+        "--if-needed",
+        action="store_true",
+        help="skip when the current event already has a complete full snapshot",
+    )
     parser.add_argument("--cohort-size", type=int, default=settings.deep_cohort_size)
     parser.add_argument("--include-picks", action="store_true")
     parser.add_argument("--event", type=int)
