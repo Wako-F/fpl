@@ -530,7 +530,7 @@ class SeasonPipeline:
             )
         if snapshot:
             snapshot_id = snapshot["id"]
-            preserve_existing = bool(snapshot["duplicate_rows"])
+            preserve_existing = True
             async with self.db.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute(
@@ -615,14 +615,24 @@ class SeasonPipeline:
                     started = time.perf_counter()
                     result = probes.get(page) or await self._standings_page(page)
                     duration_ms = round((time.perf_counter() - started) * 1000)
-                    await self._write_standings_page(
-                        snapshot_id,
-                        event,
-                        page,
-                        result,
-                        duration_ms,
-                        preserve_existing=preserve_existing,
-                    )
+                    for write_attempt in range(3):
+                        try:
+                            await self._write_standings_page(
+                                snapshot_id,
+                                event,
+                                page,
+                                result,
+                                duration_ms,
+                                preserve_existing=preserve_existing,
+                            )
+                            break
+                        except (
+                            asyncpg.exceptions.DeadlockDetectedError,
+                            asyncpg.exceptions.SerializationError,
+                        ):
+                            if write_attempt == 2:
+                                raise
+                            await asyncio.sleep(0.2 * (write_attempt + 1) + random.random() * 0.2)
                     async with progress_lock:
                         pages_done += 1
                         if pages_done % 50 == 0 or pages_done == last_page:
