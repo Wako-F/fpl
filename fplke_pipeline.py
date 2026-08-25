@@ -396,6 +396,8 @@ class SeasonPipeline:
         page: int,
         result: FetchResult,
         duration_ms: int,
+        *,
+        preserve_existing: bool = False,
     ) -> int:
         await self.store_raw(result, "kenya_standings", page, event=event, page=page)
         if result.status_code != 200:
@@ -404,11 +406,12 @@ class SeasonPipeline:
         rows = standings.get("results", [])
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
-                    "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1 AND page=$2",
-                    snapshot_id,
-                    page,
-                )
+                if not preserve_existing:
+                    await conn.execute(
+                        "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1 AND page=$2",
+                        snapshot_id,
+                        page,
+                    )
                 await conn.executemany(
                     """
                     INSERT INTO standings_snapshot_rows
@@ -466,6 +469,7 @@ class SeasonPipeline:
         resume: bool,
         require_data_checked: bool,
         if_needed: bool,
+        repair_passes: int,
     ) -> dict[str, Any]:
         event = await self.current_event()
         if event is None:
@@ -489,10 +493,12 @@ class SeasonPipeline:
                 SELECT id,managers_collected,pages_collected FROM standings_snapshots
                 WHERE season_id=$1 AND event=$2 AND crawl_mode='full'
                   AND crawl_status='finished' AND is_complete
+                  AND ($3::boolean = false OR official_data_checked)
                 ORDER BY captured_at DESC LIMIT 1
                 """,
                 settings.season_id,
                 event,
+                require_data_checked,
             )
             if existing:
                 return {
@@ -524,22 +530,7 @@ class SeasonPipeline:
             )
         if snapshot:
             snapshot_id = snapshot["id"]
-            if snapshot["duplicate_rows"]:
-                async with self.db.acquire() as conn:
-                    async with conn.transaction():
-                        await conn.execute(
-                            "DELETE FROM standings_snapshot_rows WHERE snapshot_id=$1",
-                            snapshot_id,
-                        )
-                        await conn.execute(
-                            """
-                            UPDATE standings_crawl_pages SET status='pending',row_count=NULL,
-                                has_next=NULL,started_at=NULL,fetched_at=NULL,duration_ms=NULL,
-                                error_summary=NULL
-                            WHERE snapshot_id=$1
-                            """,
-                            snapshot_id,
-                        )
+            preserve_existing = bool(snapshot["duplicate_rows"])
             async with self.db.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute(
@@ -563,18 +554,20 @@ class SeasonPipeline:
                 expected_rows,
             )
         else:
+            preserve_existing = False
             snapshot_id = await self.db.fetchval(
                 """
                 INSERT INTO standings_snapshots
                     (season_id,event,source_note,crawl_mode,crawl_status,started_at,
-                     last_heartbeat_at,expected_pages,expected_rows)
-                VALUES ($1,$2,$3,'full','running',now(),now(),$4,$5) RETURNING id
+                     last_heartbeat_at,expected_pages,expected_rows,official_data_checked)
+                VALUES ($1,$2,$3,'full','running',now(),now(),$4,$5,$6) RETURNING id
                 """,
                 settings.season_id,
                 event,
                 "Official Kenya country league; resumable complete crawl",
                 last_page,
                 expected_rows,
+                data_checked,
             )
 
         await self.db.execute(
@@ -623,7 +616,12 @@ class SeasonPipeline:
                     result = probes.get(page) or await self._standings_page(page)
                     duration_ms = round((time.perf_counter() - started) * 1000)
                     await self._write_standings_page(
-                        snapshot_id, event, page, result, duration_ms
+                        snapshot_id,
+                        event,
+                        page,
+                        result,
+                        duration_ms,
+                        preserve_existing=preserve_existing,
                     )
                     async with progress_lock:
                         pages_done += 1
@@ -700,7 +698,8 @@ class SeasonPipeline:
             """
             UPDATE standings_snapshots SET crawl_status=$2,is_complete=$3,
                 pages_collected=$4,managers_collected=$5,rows_fetched=$6,
-                duplicate_rows=$7,finished_at=now(),last_heartbeat_at=now(),error_summary=$8
+                duplicate_rows=$7,finished_at=now(),last_heartbeat_at=now(),error_summary=$8,
+                official_data_checked=$9
             WHERE id=$1
             """,
             snapshot_id,
@@ -711,7 +710,34 @@ class SeasonPipeline:
             rows_fetched,
             duplicate_rows,
             error_summary,
+            data_checked,
         )
+        if (
+            not is_complete
+            and duplicate_rows > 0
+            and page_stats["failed_pages"] == 0
+            and repair_passes > 0
+        ):
+            await self.db.execute(
+                """
+                UPDATE standings_crawl_pages SET status='pending',row_count=NULL,
+                    has_next=NULL,started_at=NULL,fetched_at=NULL,duration_ms=NULL,
+                    error_summary=NULL
+                WHERE snapshot_id=$1
+                """,
+                snapshot_id,
+            )
+            print(
+                f"full standings repair pass: {duplicate_rows} entries still missing; "
+                f"{repair_passes} pass(es) available",
+                flush=True,
+            )
+            return await self.sync_full_standings(
+                resume=True,
+                require_data_checked=require_data_checked,
+                if_needed=False,
+                repair_passes=repair_passes - 1,
+            )
         if not is_complete:
             raise RuntimeError(error_summary)
         return {
@@ -731,12 +757,14 @@ class SeasonPipeline:
         resume: bool = False,
         require_data_checked: bool = False,
         if_needed: bool = False,
+        repair_passes: int = 2,
     ) -> dict[str, Any]:
         if max_pages is None:
             return await self.sync_full_standings(
                 resume=resume,
                 require_data_checked=require_data_checked,
                 if_needed=if_needed,
+                repair_passes=repair_passes,
             )
         event = await self.current_event()
         snapshot_id = await self.db.fetchval(
@@ -1040,6 +1068,7 @@ async def run(args: argparse.Namespace) -> None:
                 resume=args.resume,
                 require_data_checked=args.require_data_checked,
                 if_needed=args.if_needed,
+                repair_passes=args.repair_passes,
             )
         elif args.job == "live":
             event = args.event or await pipeline.current_event()
@@ -1055,6 +1084,7 @@ async def run(args: argparse.Namespace) -> None:
                 resume=args.resume,
                 require_data_checked=args.require_data_checked,
                 if_needed=args.if_needed,
+                repair_passes=args.repair_passes,
             )
             event = stats["bootstrap"].get("current_event")
             if event:
@@ -1108,6 +1138,12 @@ def parse_args() -> argparse.Namespace:
         "--if-needed",
         action="store_true",
         help="skip when the current event already has a complete full snapshot",
+    )
+    parser.add_argument(
+        "--repair-passes",
+        type=int,
+        default=2,
+        help="additional full passes used to close gaps caused by moving ranks",
     )
     parser.add_argument("--cohort-size", type=int, default=settings.deep_cohort_size)
     parser.add_argument("--include-picks", action="store_true")

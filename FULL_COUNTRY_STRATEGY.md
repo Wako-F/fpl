@@ -66,14 +66,17 @@ managers.
 9. **Atomic publication** — running or failed snapshots never enter the public latest-snapshot
    view.
 10. **Completeness proof** — publication requires a contiguous page set, a verified terminal
-    page, the expected raw row count, zero failed pages, and zero duplicate entry IDs.
-11. **One full snapshot per event** — `--if-needed` prevents unnecessary repeats after a
-    complete snapshot exists.
-12. **Workload separation** — full standings, fast standings, live players, and deep manager
+    page, the expected raw row count, zero failed pages, and at least the expected number of
+    unique entry IDs.
+11. **Moving-rank repair** — when ranks shift during collection, subsequent passes are unioned
+    into the same snapshot until cross-page gaps are closed.
+12. **One final snapshot per event** — `--if-needed` skips repeat work only after a complete
+    snapshot captured with official `data_checked=true` exists.
+13. **Workload separation** — full standings, fast standings, live players, and deep manager
     data run on different schedules and can fail independently.
-13. **Search indexes** — entry ID plus trigram indexes keep all-country team/manager lookup
+14. **Search indexes** — entry ID plus trigram indexes keep all-country team/manager lookup
     responsive at hundreds of thousands of rows.
-14. **Publication labels** — the UI distinguishes fast live slices from complete country
+15. **Publication labels** — the UI distinguishes fast live slices from complete country
     tables and live/provisional/final content.
 
 ## Completeness contract
@@ -84,12 +87,13 @@ A full snapshot is publishable only when:
 finished_pages == expected_pages
 failed_pages == 0
 rows_fetched == expected_rows
-unique_entries == rows_fetched
+unique_entries >= expected_rows
 terminal_page.has_next == false
 ```
 
-If any invariant fails, the crawl is marked failed and the previously published snapshot
-remains live.
+If a live crawl has cross-page gaps, bounded repair passes first union newly observed entries
+into the same snapshot. If an invariant still fails, the crawl is marked failed and the
+previously published snapshot remains live.
 
 ## Operational commands
 

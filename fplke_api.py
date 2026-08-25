@@ -961,7 +961,8 @@ async def ops_v2(season: str | None = None):
             """
             SELECT id,event,captured_at,crawl_mode,crawl_status,started_at,finished_at,
                    last_heartbeat_at,expected_pages,expected_rows,pages_collected,
-                   managers_collected,rows_fetched,duplicate_rows,is_complete
+                   managers_collected,rows_fetched,duplicate_rows,is_complete,
+                   official_data_checked
             FROM standings_snapshots
             WHERE season_id=$1 AND crawl_mode='full'
             ORDER BY started_at DESC LIMIT 1
