@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import sys
@@ -861,15 +862,33 @@ class SeasonPipeline:
             "is_complete": is_complete,
         }
 
-    async def cohort_entries(self, limit: int) -> list[int]:
-        rows = await self.db.fetch(
-            """
-            SELECT entry FROM vw_latest_standings
-            WHERE season_id=$1 ORDER BY rank NULLS LAST LIMIT $2
-            """,
-            settings.season_id,
-            limit,
-        )
+    async def cohort_entries(self, limit: int, event: int | None = None) -> list[int]:
+        if event is None:
+            rows = await self.db.fetch(
+                """
+                SELECT entry FROM vw_latest_standings
+                WHERE season_id=$1 ORDER BY rank NULLS LAST LIMIT $2
+                """,
+                settings.season_id,
+                limit,
+            )
+        else:
+            rows = await self.db.fetch(
+                """
+                WITH target AS (
+                    SELECT id FROM standings_snapshots
+                    WHERE season_id=$1 AND event=$2
+                      AND COALESCE(crawl_status, 'finished')='finished'
+                    ORDER BY is_complete DESC,captured_at DESC LIMIT 1
+                )
+                SELECT entry FROM standings_snapshot_rows
+                WHERE snapshot_id=(SELECT id FROM target)
+                ORDER BY rank NULLS LAST LIMIT $3
+                """,
+                settings.season_id,
+                event,
+                limit,
+            )
         return [row["entry"] for row in rows]
 
     async def sync_manager(self, entry: int, event: int | None, include_picks: bool) -> None:
@@ -879,6 +898,11 @@ class SeasonPipeline:
         )
         await self.store_raw(profile_result, "manager_profile", entry)
         await self.store_raw(history_result, "manager_history", entry)
+        if profile_result.status_code != 200 or history_result.status_code != 200:
+            raise RuntimeError(
+                f"manager endpoints returned profile={profile_result.status_code} "
+                f"history={history_result.status_code}"
+            )
         if profile_result.status_code == 200:
             profile = profile_result.payload
             await self.db.execute(
@@ -967,6 +991,8 @@ class SeasonPipeline:
         if include_picks and event:
             picks_result = await self.fetch(f"/entry/{entry}/event/{event}/picks/")
             await self.store_raw(picks_result, "manager_picks", f"{entry}:{event}", event=event)
+            if picks_result.status_code != 200:
+                raise RuntimeError(f"picks endpoint returned {picks_result.status_code}")
             if picks_result.status_code == 200:
                 async with self.db.acquire() as conn:
                     async with conn.transaction():
@@ -996,34 +1022,206 @@ class SeasonPipeline:
 
     async def map_limited(
         self, items: Iterable[int], func: Callable[[int], Awaitable[None]], label: str
-    ) -> int:
+    ) -> dict[str, Any]:
         values = list(items)
-        done = 0
+        attempted = 0
+        succeeded = 0
+        errors: list[dict[str, Any]] = []
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for value in values:
+            queue.put_nowait(value)
 
-        async def wrapped(item: int) -> None:
-            nonlocal done
-            try:
-                await func(item)
-            except Exception as exc:  # continue cohort collection and report each failure
-                print(f"{label} item={item} error={exc!r}", flush=True)
-            done += 1
-            if done % 100 == 0 or done == len(values):
-                print(f"{label} {done}/{len(values)}", flush=True)
+        async def worker() -> None:
+            nonlocal attempted, succeeded
+            while True:
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    await func(item)
+                    succeeded += 1
+                except Exception as exc:  # finish the cohort and report exact coverage
+                    if len(errors) < 25:
+                        errors.append({"item": item, "error": repr(exc)})
+                    print(f"{label} item={item} error={exc!r}", flush=True)
+                finally:
+                    attempted += 1
+                    queue.task_done()
+                    if attempted % 100 == 0 or attempted == len(values):
+                        print(
+                            f"{label} {attempted}/{len(values)} "
+                            f"succeeded={succeeded} failed={attempted-succeeded}",
+                            flush=True,
+                        )
 
-        await asyncio.gather(*(wrapped(item) for item in values))
-        return done
+        workers = [
+            asyncio.create_task(worker())
+            for _ in range(min(max(1, self.concurrency), len(values)))
+        ]
+        await asyncio.gather(*workers)
+        return {
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": attempted - succeeded,
+            "errors": errors,
+        }
 
-    async def sync_cohort(self, limit: int, include_picks: bool) -> dict[str, Any]:
-        event = await self.current_event()
-        entries = await self.cohort_entries(limit)
+    async def cohort_coverage(self, entries: list[int], event: int) -> dict[str, int]:
+        if not entries:
+            return {"history_managers": 0, "picks_managers": 0}
+        history_managers = await self.db.fetchval(
+            """
+            SELECT count(DISTINCT entry) FROM manager_event_history_v2
+            WHERE season_id=$1 AND event=$2 AND entry=ANY($3::integer[])
+            """,
+            settings.season_id,
+            event,
+            entries,
+        )
+        picks_managers = await self.db.fetchval(
+            """
+            SELECT count(DISTINCT entry) FROM manager_picks_v2
+            WHERE season_id=$1 AND event=$2 AND entry=ANY($3::integer[])
+            """,
+            settings.season_id,
+            event,
+            entries,
+        )
+        return {
+            "history_managers": int(history_managers or 0),
+            "picks_managers": int(picks_managers or 0),
+        }
+
+    async def completed_events(self) -> list[int]:
+        rows = await self.db.fetch(
+            """
+            SELECT event FROM fpl_events
+            WHERE season_id=$1 AND finished
+            ORDER BY event
+            """,
+            settings.season_id,
+        )
+        return [row["event"] for row in rows]
+
+    async def register_cohort_memberships(self, entries: list[int], event: int) -> int:
+        if not entries:
+            return 0
+        snapshot_id = await self.db.fetchval(
+            """
+            SELECT id FROM standings_snapshots
+            WHERE season_id=$1 AND event=$2
+              AND COALESCE(crawl_status, 'finished')='finished'
+            ORDER BY is_complete DESC,captured_at DESC LIMIT 1
+            """,
+            settings.season_id,
+            event,
+        )
+        if snapshot_id is None:
+            raise RuntimeError(f"No standings snapshot is available for GW{event}")
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    DELETE FROM cohort_memberships
+                    WHERE season_id=$1 AND event=$2 AND cohort_name='top_national_rank'
+                      AND NOT (entry=ANY($3::integer[]))
+                    """,
+                    settings.season_id,
+                    event,
+                    entries,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO cohort_memberships
+                        (season_id,event,cohort_name,entry,selected_rank,source_snapshot_id,selected_at)
+                    SELECT $1,$2,'top_national_rank',r.entry,r.rank,$3,now()
+                    FROM standings_snapshot_rows r
+                    WHERE r.snapshot_id=$3 AND r.entry=ANY($4::integer[])
+                    ON CONFLICT (season_id,event,cohort_name,entry) DO UPDATE SET
+                        selected_rank=EXCLUDED.selected_rank,
+                        source_snapshot_id=EXCLUDED.source_snapshot_id,
+                        selected_at=now()
+                    """,
+                    settings.season_id,
+                    event,
+                    snapshot_id,
+                    entries,
+                )
+        return int(snapshot_id)
+
+    async def sync_cohort(
+        self,
+        limit: int,
+        include_picks: bool,
+        event: int | None = None,
+        if_needed: bool = False,
+        min_success_rate: float = 0.9,
+    ) -> dict[str, Any]:
+        event = event or await self.current_event()
+        if event is None:
+            raise RuntimeError("No event is available; run bootstrap first")
+        entries = await self.cohort_entries(limit, event)
+        if not entries:
+            raise RuntimeError(f"No standings snapshot is available for GW{event}")
+        source_snapshot_id = await self.register_cohort_memberships(entries, event)
+        required = math.ceil(len(entries) * min_success_rate)
+        before = await self.cohort_coverage(entries, event)
+        if if_needed and before["history_managers"] >= required and (
+            not include_picks or before["picks_managers"] >= required
+        ):
+            return {
+                "event": event,
+                "requested": len(entries),
+                "required": required,
+                "skipped": True,
+                "source_snapshot_id": source_snapshot_id,
+                "coverage": before,
+            }
 
         async def one(entry: int) -> None:
             await self.sync_manager(entry, event, include_picks)
 
-        done = await self.map_limited(entries, one, "deep cohort")
-        return {"event": event, "requested": limit, "collected": done, "picks": include_picks}
+        collection = await self.map_limited(entries, one, f"deep cohort GW{event}")
+        coverage = await self.cohort_coverage(entries, event)
+        return {
+            "event": event,
+            "requested": len(entries),
+            "required": required,
+            "skipped": False,
+            "source_snapshot_id": source_snapshot_id,
+            "collection": collection,
+            "coverage": coverage,
+            "picks": include_picks,
+        }
 
-    async def quality_checks(self, run_id: int, event: int | None) -> list[dict[str, str]]:
+    async def sync_completed_cohorts(
+        self,
+        limit: int,
+        include_picks: bool,
+        if_needed: bool,
+        min_success_rate: float,
+    ) -> list[dict[str, Any]]:
+        results = []
+        for event in await self.completed_events():
+            results.append(
+                await self.sync_cohort(
+                    limit,
+                    include_picks,
+                    event=event,
+                    if_needed=if_needed,
+                    min_success_rate=min_success_rate,
+                )
+            )
+        return results
+
+    async def quality_checks(
+        self,
+        run_id: int,
+        event: int | None,
+        cohort_results: list[dict[str, Any]] | None = None,
+        require_picks: bool = False,
+    ) -> list[dict[str, str]]:
         checks = [
             ("one_active_season", "SELECT count(*) FROM seasons WHERE is_active", 1, "fail"),
             ("event_count", "SELECT count(*) FROM fpl_events WHERE season_id=$1", 38, "fail"),
@@ -1055,6 +1253,29 @@ class SeasonPipeline:
                 str(expected),
             )
             results.append({"check": name, "status": status, "observed": str(observed)})
+        for cohort in cohort_results or []:
+            for metric in ("history_managers", "picks_managers"):
+                if metric == "picks_managers" and not require_picks:
+                    continue
+                observed = cohort["coverage"][metric]
+                expected = cohort["required"]
+                status = "pass" if observed >= expected else "fail"
+                name = f"cohort_{'history' if metric == 'history_managers' else 'picks'}_gw_{cohort['event']}"
+                await self.db.execute(
+                    """
+                    INSERT INTO data_quality_results
+                        (pipeline_run_id,season_id,event,check_name,status,observed_value,expected_value)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7)
+                    """,
+                    run_id,
+                    settings.season_id,
+                    cohort["event"],
+                    name,
+                    status,
+                    str(observed),
+                    str(expected),
+                )
+                results.append({"check": name, "status": status, "observed": str(observed)})
         return results
 
 
@@ -1086,7 +1307,21 @@ async def run(args: argparse.Namespace) -> None:
                 raise RuntimeError("No current event; run bootstrap first or pass --event")
             stats["live"] = await pipeline.sync_event_live(event)
         elif args.job == "cohort":
-            stats["cohort"] = await pipeline.sync_cohort(args.cohort_size, args.include_picks)
+            if args.all_completed:
+                stats["cohorts"] = await pipeline.sync_completed_cohorts(
+                    args.cohort_size,
+                    args.include_picks,
+                    args.if_needed,
+                    args.min_success_rate,
+                )
+            else:
+                stats["cohort"] = await pipeline.sync_cohort(
+                    args.cohort_size,
+                    args.include_picks,
+                    event=args.event,
+                    if_needed=args.if_needed,
+                    min_success_rate=args.min_success_rate,
+                )
         elif args.job == "weekly":
             stats["bootstrap"] = await pipeline.sync_bootstrap()
             stats["standings"] = await pipeline.sync_standings(
@@ -1104,7 +1339,13 @@ async def run(args: argparse.Namespace) -> None:
             raise ValueError(f"Unknown job {args.job}")
 
         event = await pipeline.current_event()
-        stats["quality"] = await pipeline.quality_checks(run_id, event)
+        cohort_results = stats.get("cohorts") or ([stats["cohort"]] if "cohort" in stats else [])
+        stats["quality"] = await pipeline.quality_checks(
+            run_id,
+            event,
+            cohort_results=cohort_results,
+            require_picks=args.include_picks,
+        )
         if any(row["status"] == "fail" for row in stats["quality"]):
             raise RuntimeError("One or more required data-quality checks failed")
         await db.execute(
@@ -1147,7 +1388,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--if-needed",
         action="store_true",
-        help="skip when the current event already has a complete full snapshot",
+        help="skip standings or cohort work that already meets its completion contract",
     )
     parser.add_argument(
         "--repair-passes",
@@ -1157,12 +1398,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--cohort-size", type=int, default=settings.deep_cohort_size)
     parser.add_argument("--include-picks", action="store_true")
+    parser.add_argument(
+        "--all-completed",
+        action="store_true",
+        help="collect an event-specific cohort for every completed gameweek",
+    )
+    parser.add_argument(
+        "--min-success-rate",
+        type=float,
+        default=settings.cohort_min_success_rate,
+        help="minimum stored history/picks coverage required for a cohort run",
+    )
     parser.add_argument("--event", type=int)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not 0 < args.min_success_rate <= 1:
+        parser.error("--min-success-rate must be greater than 0 and at most 1")
+    if args.cohort_size < 1:
+        parser.error("--cohort-size must be positive")
+    return args
 
 
 if __name__ == "__main__":
+    arguments = parse_args()
     if "DATABASE_URL" not in os.environ:
         print("DATABASE_URL is required", file=sys.stderr)
         raise SystemExit(2)
-    asyncio.run(run(parse_args()))
+    asyncio.run(run(arguments))

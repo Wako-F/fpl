@@ -24,6 +24,8 @@ python -m venv .venv
 psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -f migrations/001_season_platform.sql
 psql "$DATABASE_URL" -f migrations/002_full_country_crawls.sql
+psql "$DATABASE_URL" -f migrations/003_snapshot_finality.sql
+psql "$DATABASE_URL" -f migrations/004_content_pack_coverage.sql
 python fplke_pipeline.py bootstrap
 python fplke_pipeline.py standings --max-pages 20
 python fplke_pipeline.py live
@@ -72,6 +74,15 @@ scripts/run_postlock.sh
 ```
 
 This refreshes static data and standings, updates the manager cohort and picks, and writes the article, social, engineering, and machine-readable briefs under `content/generated/`.
+It incrementally backfills every completed gameweek, records event-specific cohort membership,
+and generates analysis, manifests, and accessible SVG visualizations for each week.
+
+To repair or rebuild the full season manually:
+
+```bash
+python fplke_pipeline.py cohort --cohort-size 1000 --include-picks --all-completed --if-needed
+python generate_weekly_content.py --all-completed
+```
 
 ## Production control room
 

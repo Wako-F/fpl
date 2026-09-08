@@ -7,4 +7,6 @@ Type=oneshot
 User=codex
 Group=codex
 WorkingDirectory=/opt/fplke
+EnvironmentFile=/opt/fplke/.env
 ExecStart=/opt/fplke/scripts/run_postlock.sh
+TimeoutStartSec=4h

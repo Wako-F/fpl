@@ -16,6 +16,22 @@ class Settings:
     request_concurrency: int = int(os.getenv("FPLKE_CONCURRENCY", "4"))
     request_pause_seconds: float = float(os.getenv("FPLKE_REQUEST_PAUSE", "0.15"))
     deep_cohort_size: int = int(os.getenv("FPLKE_DEEP_COHORT_SIZE", "1000"))
+    cohort_min_success_rate: float = float(
+        os.getenv("FPLKE_COHORT_MIN_SUCCESS_RATE", "0.90")
+    )
+    content_min_cohort_size: int = int(
+        os.getenv("FPLKE_CONTENT_MIN_COHORT_SIZE", "900")
+    )
+
+    def __post_init__(self) -> None:
+        if self.deep_cohort_size < 1:
+            raise ValueError("FPLKE_DEEP_COHORT_SIZE must be positive")
+        if not 0 < self.cohort_min_success_rate <= 1:
+            raise ValueError("FPLKE_COHORT_MIN_SUCCESS_RATE must be between 0 and 1")
+        if not 1 <= self.content_min_cohort_size <= self.deep_cohort_size:
+            raise ValueError(
+                "FPLKE_CONTENT_MIN_COHORT_SIZE must be between 1 and FPLKE_DEEP_COHORT_SIZE"
+            )
 
 
 settings = Settings()

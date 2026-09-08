@@ -21,9 +21,16 @@ export const metadata: Metadata = {
 
 const artifactLabels: Record<string, string> = {
   article: "Article draft",
+  analysis: "Analysis report",
   social: "Social pack",
   engineering: "Engineering note",
   brief: "JSON brief",
+  manifest: "Checksum manifest",
+  "decision-dashboard": "Decision dashboard SVG",
+  "score-distribution": "Score distribution SVG",
+  captaincy: "Captaincy SVG",
+  "top-players": "Top players SVG",
+  "rank-movers": "Rank movers SVG",
 };
 
 function kenyaTime(value?: string | null) {
@@ -81,6 +88,7 @@ export default async function OpsPage({
   const finishedPages = progress?.finished_pages ?? crawl?.pages_collected ?? 0;
   const coveragePercent = expectedPages ? Math.min(100, (finishedPages / expectedPages) * 100) : 0;
   const allQualityPass = ops.quality.every((check) => check.status === "pass");
+  const readyWeeks = ops.content_coverage.filter((week) => week.ready).length;
 
   return (
     <>
@@ -116,7 +124,20 @@ export default async function OpsPage({
           <StatBlock label="Published managers" value={(snapshot?.managers_collected ?? 0).toLocaleString("en-KE")} detail={snapshot?.is_complete ? "complete Kenya table" : "fast live slice"} />
           <StatBlock label="Pages published" value={(snapshot?.pages_collected ?? 0).toLocaleString("en-KE")} detail={snapshot?.crawl_mode ?? "awaiting crawl"} />
           <StatBlock label="Quality checks" value={`${ops.quality.filter((item) => item.status === "pass").length}/${ops.quality.length}`} detail={allQualityPass ? "all passing" : "review required"} />
-          <StatBlock label="Content packs" value={ops.content_packs.length.toLocaleString("en-KE")} detail={ops.content_packs[0] ? `latest: GW${ops.content_packs[0].event} · ${ops.content_packs[0].status}` : "none generated"} />
+          <StatBlock label="Complete weeks" value={`${readyWeeks}/${ops.content_coverage.length}`} detail={readyWeeks === ops.content_coverage.length ? "all finished weeks ready" : "backfill required"} />
+        </section>
+
+        <section className="mt-16">
+          <div className="font-mono text-xs uppercase tracking-[0.2em] text-[#1f6b4d]">Season coverage</div>
+          <h2 className="mt-3 text-4xl font-semibold tracking-[-0.04em]">Every completed gameweek</h2>
+          <div className="mt-7 overflow-x-auto border-y border-stone-950/10">
+            <table className="w-full min-w-[760px] text-left text-sm">
+              <thead className="text-xs uppercase tracking-[0.12em] text-stone-500"><tr><th className="py-3 pr-5">Week</th><th className="py-3 pr-5">Cohort</th><th className="py-3 pr-5">Histories</th><th className="py-3 pr-5">Pick sets</th><th className="py-3 pr-5">Facts</th><th className="py-3 pr-5">Artifacts</th><th className="py-3">State</th></tr></thead>
+              <tbody className="divide-y divide-stone-950/10">
+                {ops.content_coverage.map((week) => <tr key={week.event}><td className="py-4 pr-5 font-semibold">GW{week.event}</td><td className="mono-num py-4 pr-5">{week.selected_managers.toLocaleString("en-KE")}</td><td className="mono-num py-4 pr-5">{week.history_managers.toLocaleString("en-KE")}</td><td className="mono-num py-4 pr-5">{week.picks_managers.toLocaleString("en-KE")}</td><td className="mono-num py-4 pr-5">{week.facts}</td><td className="mono-num py-4 pr-5">{week.artifacts.length}</td><td className="py-4"><span className={`rounded px-2 py-1 font-mono text-[0.65rem] uppercase ${statusTone(week.ready ? "pass" : "fail")}`}>{week.ready ? "ready" : "incomplete"}</span></td></tr>)}
+              </tbody>
+            </table>
+          </div>
         </section>
 
         <section className="mt-16 grid gap-8 lg:grid-cols-[0.64fr_0.36fr]">

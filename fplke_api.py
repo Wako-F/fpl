@@ -10,6 +10,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 
+from fplke_settings import settings
+
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -915,16 +917,25 @@ async def fixtures_v2(event: int, season: str | None = None):
         return [dict(row) for row in rows]
 
 
+CONTENT_ARTIFACTS = {
+    "article": "article.md",
+    "analysis": "analysis.md",
+    "social": "social.md",
+    "engineering": "engineering.md",
+    "brief": "brief.json",
+    "manifest": "manifest.json",
+    "decision-dashboard": "visualizations/decision-dashboard.svg",
+    "score-distribution": "visualizations/score-distribution.svg",
+    "captaincy": "visualizations/captaincy.svg",
+    "top-players": "visualizations/top-players.svg",
+    "rank-movers": "visualizations/rank-movers.svg",
+}
+
+
 def artifact_inventory(season_id: str, event: int) -> list[dict[str, object]]:
     directory = CONTENT_ROOT / season_id / f"gw-{event:02d}"
-    artifacts = {
-        "article": "article.md",
-        "social": "social.md",
-        "engineering": "engineering.md",
-        "brief": "brief.json",
-    }
     inventory: list[dict[str, object]] = []
-    for key, filename in artifacts.items():
+    for key, filename in CONTENT_ARTIFACTS.items():
         path = directory / filename
         if not path.is_file():
             continue
@@ -986,12 +997,22 @@ async def ops_v2(season: str | None = None):
             )
         runs = await conn.fetch(
             """
+            WITH non_live AS (
+                SELECT * FROM pipeline_runs
+                WHERE season_id=$1 AND job_name <> 'live'
+                ORDER BY started_at DESC LIMIT 20
+            ), recent_live AS (
+                SELECT * FROM pipeline_runs
+                WHERE season_id=$1 AND job_name = 'live'
+                ORDER BY started_at DESC LIMIT 5
+            ), selected AS (
+                SELECT * FROM non_live UNION ALL SELECT * FROM recent_live
+            )
             SELECT id,job_name,status,started_at,finished_at,
                    round(extract(epoch FROM (COALESCE(finished_at,now())-started_at)))::integer
                        AS duration_seconds,
                    (error IS NOT NULL) AS has_error
-            FROM pipeline_runs WHERE season_id=$1
-            ORDER BY started_at DESC LIMIT 16
+            FROM selected ORDER BY started_at DESC
             """,
             season_id,
         )
@@ -1027,11 +1048,66 @@ async def ops_v2(season: str | None = None):
             """,
             season_id,
         )
+        coverage_rows = await conn.fetch(
+            """
+            WITH selected AS (
+                SELECT event,count(DISTINCT entry)::integer AS selected_managers
+                FROM cohort_memberships
+                WHERE season_id=$1 AND cohort_name='top_national_rank'
+                GROUP BY event
+            ), histories AS (
+                SELECT c.event,count(DISTINCT h.entry)::integer AS history_managers
+                FROM cohort_memberships c
+                JOIN manager_event_history_v2 h
+                  ON h.season_id=c.season_id AND h.event=c.event AND h.entry=c.entry
+                WHERE c.season_id=$1 AND c.cohort_name='top_national_rank'
+                GROUP BY c.event
+            ), picks AS (
+                SELECT c.event,count(DISTINCT p.entry)::integer AS picks_managers
+                FROM cohort_memberships c
+                JOIN manager_picks_v2 p
+                  ON p.season_id=c.season_id AND p.event=c.event AND p.entry=c.entry
+                WHERE c.season_id=$1 AND c.cohort_name='top_national_rank'
+                GROUP BY c.event
+            ), facts AS (
+                SELECT event,count(DISTINCT fact_key)::integer AS facts,
+                       max(calculated_at) AS content_updated_at,
+                       bool_or(status='final') AS has_final_content
+                FROM content_facts WHERE season_id=$1 GROUP BY event
+            )
+            SELECT e.event,e.finished,e.data_checked,
+                   coalesce(s.selected_managers,0)::integer AS selected_managers,
+                   coalesce(h.history_managers,0)::integer AS history_managers,
+                   coalesce(p.picks_managers,0)::integer AS picks_managers,
+                   coalesce(f.facts,0)::integer AS facts,
+                   f.content_updated_at,coalesce(f.has_final_content,false) AS has_final_content
+            FROM fpl_events e
+            LEFT JOIN selected s ON s.event=e.event
+            LEFT JOIN histories h ON h.event=e.event
+            LEFT JOIN picks p ON p.event=e.event
+            LEFT JOIN facts f ON f.event=e.event
+            WHERE e.season_id=$1 AND e.finished
+            ORDER BY e.event
+            """,
+            season_id,
+        )
         packs = []
         for row in pack_rows:
             item = dict(row)
             item["artifacts"] = artifact_inventory(season_id, row["event"])
             packs.append(item)
+        content_coverage = []
+        for row in coverage_rows:
+            item = dict(row)
+            item["artifacts"] = artifact_inventory(season_id, row["event"])
+            item["ready"] = (
+                row["history_managers"] >= settings.content_min_cohort_size
+                and row["picks_managers"] >= settings.content_min_cohort_size
+                and row["facts"] >= 15
+                and len(item["artifacts"]) >= 10
+                and (not row["data_checked"] or bool(row["has_final_content"]))
+            )
+            content_coverage.append(item)
         return {
             "season": season_id,
             "event": dict(event) if event else None,
@@ -1046,6 +1122,7 @@ async def ops_v2(season: str | None = None):
             "quality": [dict(row) for row in quality],
             "runs": [dict(row) for row in runs],
             "content_packs": packs,
+            "content_coverage": content_coverage,
         }
 
 
@@ -1056,13 +1133,7 @@ async def content_pack_artifact_v2(
     season: str | None = None,
 ):
     season_id = await resolve_season(season)
-    filenames = {
-        "article": "article.md",
-        "social": "social.md",
-        "engineering": "engineering.md",
-        "brief": "brief.json",
-    }
-    filename = filenames.get(artifact)
+    filename = CONTENT_ARTIFACTS.get(artifact)
     if filename is None or not 1 <= event <= 38:
         raise HTTPException(status_code=404, detail="Content artifact not found")
     path = CONTENT_ROOT / season_id / f"gw-{event:02d}" / filename

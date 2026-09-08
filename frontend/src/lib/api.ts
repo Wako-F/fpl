@@ -208,7 +208,25 @@ export type OpsStatus = {
     source_snapshot_id: number;
     largest_sample: number;
     artifacts: Array<{
-      key: "article" | "social" | "engineering" | "brief";
+      key: "article" | "analysis" | "social" | "engineering" | "brief" | "manifest" | "decision-dashboard" | "score-distribution" | "captaincy" | "top-players" | "rank-movers";
+      filename: string;
+      bytes: number;
+      modified_at: string;
+    }>;
+  }>;
+  content_coverage: Array<{
+    event: number;
+    finished: boolean;
+    data_checked: boolean;
+    selected_managers: number;
+    history_managers: number;
+    picks_managers: number;
+    facts: number;
+    content_updated_at: string | null;
+    has_final_content: boolean;
+    ready: boolean;
+    artifacts: Array<{
+      key: string;
       filename: string;
       bytes: number;
       modified_at: string;
@@ -219,7 +237,7 @@ export type OpsStatus = {
 export type ContentArtifact = {
   season: string;
   event: number;
-  artifact: "article" | "social" | "engineering" | "brief";
+  artifact: string;
   filename: string;
   bytes: number;
   modified_at: string;
